@@ -1,0 +1,59 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ *
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
+ 
+#if defined( HLSL )
+#include "HLSL_bridge.h"
+#else // GLSL
+#extension GL_ARB_shading_language_include : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference2 : enable
+#include "GLSL_Bridge.h"
+#endif
+
+#include "CPU_Bridge.h"
+
+////////////////////////////////////////////////////////////////////////
+RAW_BUFFER_BINDING( inIndirectOpsCount, 0 );
+STRUCTURED_BUFFER_BINDING( IndirectOpDesc, inIndirectOps, 1 )
+
+STORAGE_STRUCTURED_BUFFER_BINDING( IndirectOpsParserArgs, outIndirectArgs, 0 )
+TYPED_STORAGE_BUFFER_BINDING( uint, outIndirectOpsCount, 1)
+
+////////////////////////////////////////////////////////////////////////
+#define X_SIZE OP_PARSE_SHDR_X
+#define Y_SIZE OP_PARSE_SHDR_Y
+BEGIN_MAIN( DECLARE_THREAD_GROUP_SIZE( X_SIZE, Y_SIZE, 1 ), INIT_DISPATCH_THREAD_ID_SEMANTIC( uint3, DTid ) )
+{
+    const uint id = DTid.x;
+    const uint numIndirectOps = inIndirectOpsCount.Load( 0 );
+
+    if( id == 0 )
+        outIndirectOpsCount[ 0 ] = numIndirectOps;
+
+    if( id >= numIndirectOps)
+        return;
+
+    IndirectOpDesc operation = inIndirectOps[ id ];
+    IndirectOpsParserArgs outArgs = _IndirectOpsParserArgs();
+    outArgs.type = operation.type;
+    outArgs.count = operation.count;
+    outArgs.data = operation.data;
+    outArgs.stride = operation.stride;
+    outArgs.threadCountX = DivideRoundUp( outArgs.count, OP_PARSE_SHDR_X );
+    outArgs.threadCountY = 1;
+    outArgs.threadCountZ = 1;
+
+    outIndirectArgs[ id ] = outArgs;
+}
+END_MAIN

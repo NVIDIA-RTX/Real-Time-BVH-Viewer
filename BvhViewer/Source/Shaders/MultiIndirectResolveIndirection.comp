@@ -1,0 +1,99 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ *
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
+ 
+#if defined( HLSL )
+#include "HLSL_bridge.h"
+#else // GLSL
+#extension GL_ARB_shading_language_include : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference2 : enable
+#include "GLSL_Bridge.h"
+#endif
+
+#include "CPU_Bridge.h"
+
+////////////////////////////////////////////////////////////////////////
+PUSH_CONSTANTS_BINDING( MULTI_INDIRECT_PUSH_CONSTANTS, gConstants, 0 );
+
+RAW_BUFFER_BINDING( inOriginalCountBuffer, 0 )
+RAW_BUFFER_BINDING( inOriginalInputBuffer, 1 )
+RAW_BUFFER_BINDING( inOriginalDestinationBuffer, 2 )
+
+RAW_BUFFER_STORAGE_BINDING( outCountBuffer, 0 )
+RAW_BUFFER_STORAGE_BINDING( outArgBuffer,   1 )
+
+////////////////////////////////////////////////////////////////////////
+void WriteOutSignature( MultiIndirectResloveInputsArgs data )
+{
+    const uint u64Num = 1 + 1;
+    const uint u32Num = 4;
+    const uint outputByteStride = u64Num * 8 + u32Num * 4;
+
+    uint outputOffset = 0;
+    outArgBuffer.Store2( outputOffset, U64toU2( data.countBufferAddr ) );                outputOffset += 4 * 2;
+    outArgBuffer.Store2( outputOffset, U64toU2( data.inputBufferAddr ) );                outputOffset += 4 * 2;
+    outArgBuffer.Store2( outputOffset, U64toU2( data.destinationBufferAddr ) );          outputOffset += 4 * 2;
+
+    outArgBuffer.Store2( outputOffset, uint2( data.threadCountX, data.threadCountY ) );  outputOffset += 4 * 2;
+    outArgBuffer.Store2( outputOffset, uint2( data.threadCountZ, data.pad ) );           outputOffset += 4 * 2;
+}
+
+#define X_SIZE MI_RESOLVE_SHDR_X
+#define Y_SIZE MI_RESOLVE_SHDR_Y
+BEGIN_MAIN( DECLARE_THREAD_GROUP_SIZE( X_SIZE, Y_SIZE, 1 ), INIT_DISPATCH_THREAD_ID_SEMANTIC( uint3, DTid ) )
+{
+    const uint id = DTid.x;
+    if( id > 0 )
+        return;
+
+    const bool isIndirectedCounts = _IsIndirectedCount( gConstants.packedBools );
+    const bool isIndirectedInputs = _IsIndirectedInput( gConstants.packedBools );
+    const bool hasCountsBuffer = gConstants.originalCountBufferAddr != 0;
+    const bool isIndirectedDst = _IsIndirectedDestination( gConstants.packedBools );
+
+    uint64_t outCountBufferAddr = 0;
+    if( hasCountsBuffer && isIndirectedCounts )
+        outCountBufferAddr = U2toU64(inOriginalCountBuffer.Load2(0));
+    else if( hasCountsBuffer && !isIndirectedCounts )
+        outCountBufferAddr = gConstants.originalCountBufferAddr;
+    else
+    {
+        outCountBuffer.Store( 0, gConstants.maxArgCount );
+        outCountBufferAddr = gConstants.internalCountBufferAddr;
+    }
+
+    // check that arg buffer is non-zero at the cpu side
+    uint64_t inputsAddr = 0;
+    if( isIndirectedInputs )
+        inputsAddr = U2toU64(inOriginalInputBuffer.Load2(0));
+    else
+        inputsAddr = gConstants.originalInputBufferAddr;
+
+    uint64_t dstAddr = 0;
+    if( isIndirectedDst )
+        dstAddr = U2toU64(inOriginalDestinationBuffer.Load2(0));
+    else
+        dstAddr = gConstants.originalDestinationBufferAddr;
+
+    MultiIndirectResloveInputsArgs signature = _MultiIndirectResloveInputsArgs();
+    signature.countBufferAddr = outCountBufferAddr; // root arg
+    signature.inputBufferAddr = inputsAddr; // root arg
+    signature.destinationBufferAddr = dstAddr; // root arg
+    signature.threadCountX = DivideRoundUp( max( gConstants.maxArgCount, 1 ), CLAS_PARSE_SHDR_X );
+    signature.threadCountY = 1;
+    signature.threadCountZ = 1;
+    signature.pad = 0;
+    WriteOutSignature( signature );
+}
+END_MAIN

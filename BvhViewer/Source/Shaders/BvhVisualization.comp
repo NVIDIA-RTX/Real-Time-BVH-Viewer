@@ -1,0 +1,787 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ *
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
+ 
+#if defined HLSL
+    #if defined( NV_GPU )
+        #define NV_SHADER_EXTN_SLOT u4
+        #define NV_SHADER_EXTN_REGISTER_SPACE space0
+        #define ENABLE_LSS
+        #define ENABLE_POSITION_FETCH
+        #include "nvHLSLExtns.h"
+
+    #elif defined( AMD_GPU )
+        #include "ags_shader_intrinsics_dx12.hlsl"
+    #endif
+#include "Include/HLSL_Bridge.h"
+
+#else // if GLSL
+    #extension GL_ARB_shading_language_include : enable
+    #extension GL_EXT_buffer_reference : enable
+    #extension GL_EXT_buffer_reference2 : enable
+    #extension GL_ARB_shader_clock : enable
+    #extension GL_ARB_gpu_shader_int64 : enable
+    #extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+    #extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+    #extension GL_EXT_ray_query : enable
+    #extension GL_EXT_ray_flags_primitive_culling : enable
+    #if defined( GLSL_ENABLE_LSS )
+        #extension GL_NV_linear_swept_spheres : enable
+        #define ENABLE_LSS
+    #endif
+    #if defined( GLSL_ENABLE_POSITION_FETCH )
+        #extension GL_EXT_ray_tracing_position_fetch : enable
+        #define ENABLE_POSITION_FETCH
+    #endif
+
+    #define ENABLE_RAYQUERY_IMPL
+
+    #include "Include/GLSL_bridge.h"
+#endif // GLSL
+
+#include "MathLibSimplified.h"
+#include "CPU_Bridge.h"
+#include "HashMap.h"
+
+////////////////////////////////////////////////////////////////////////
+TLAS_BINDING(                                               gTLAS,          0 );
+
+TYPED_BUFFER_BINDING(               uint,                   gBlasHashes,    1 );
+TYPED_BUFFER_BINDING(               uint3,                  gBlasDescs,     2 );
+TYPED_BUFFER_BINDING(               uint,                   gGeometryDesc,  3 );
+
+STRUCTURED_BUFFER_BINDING(          TlasInstanceDesc,       gInstanceDescs, 4 );
+
+STORAGE_TEXTURE_BINDING(            float4,                 gOutput,        0 );
+STORAGE_STRUCTURED_BUFFER_BINDING(  FeedbackBufferLayout,   gReadback,      1 );
+
+#if defined HLSL
+STORAGE_STRUCTURED_BUFFER_BINDING(  uint,                   inBlasKey,      2 )
+STORAGE_STRUCTURED_BUFFER_BINDING(  ClusteredBlasDescGPU,   inBlasData,     3 )
+#endif
+
+CONSTANT_BUFFER_BINDING(            ConstantBufferLayout,   gConstants,     0 );
+
+////////////////////////////////////////////////////////////////////////
+#if defined HLSL
+HASH_MAP_IMPLEMENTATION( Blas, inBlasKey, inBlasData, ClusteredBlasDescGPU, gConstants.blasMapCapacity )
+#endif
+
+////////////////////////////////////////////////////////////////////////
+uint GetFlagFilterVisualizationMode()
+{ return _GetFlagFilterVisualizationMode( gConstants.flagFilterMask ); }
+
+uint GetFlagFilterInclusionMode()
+{ return _GetFlagFilterInclusionMode( gConstants.flagFilterMask ); }
+
+uint GetFlagFilterLogicalMode()
+{ return _GetFlagFilterLogicalMode( gConstants.flagFilterMask ); }
+
+bool GetPackedBool( uint entry )
+{ return _GetPackedBool( gConstants.packedBools, entry ); }
+
+bool IsGeometryTypeSet( uint type ) 
+{ return type == GEOMETRY_TYPE_NONE ? gConstants.geometryTypeMask == type : ( gConstants.geometryTypeMask & type ) == type; }
+
+bool IsGeometryTriangle( uint type )
+{
+    return  type == GEOMETRY_TYPE_TRIANGLE      ||
+            type == GEOMETRY_TYPE_OMM_TRIANGLE  ||
+            type == GEOMETRY_TYPE_CLUSTER_TRIANGLE;
+}
+
+////////////////////////////////////////////////////////////////////////
+uint HashFromGpuVirtualAddress( uint64_t a )
+{
+    uint low = uint( a & 0xFFFFFFFF );
+    uint high = uint( ( a >> 32 ) & 0xFFFFFFFF );
+    return low ^ high;
+}
+
+////////////////////////////////////////////////////////////////////////
+uint GetGeometryFlagMask( uint instanceFlags, uint blasFlags, uint geometryFlags )
+{
+    return ( ( blasFlags & AS_BUILD_FLAG_MASK ) << AS_BUILD_FLAG_MASK_SHIFT )
+         | ( ( geometryFlags & GEOMETRY_FLAG_MASK ) << GEOMETRY_FLAG_MASK_SHIFT )
+         | ( ( instanceFlags & INSTANCE_FLAG_MASK ) << INSTANCE_FLAG_MASK_SHIFT );
+}
+
+////////////////////////////////////////////////////////////////////////
+struct HitDesc
+{
+    TlasInstanceDesc instanceDesc;
+    ViewerBlasDescGPU blasDesc;
+    uint geometryFlags;
+
+    float3 flatNormal;
+    float2 barycentrics;
+
+    uint primitiveId;
+    uint instanceIndex;
+    uint instanceContributionToHitGroupIndex;
+    uint geometryIndex;
+    uint instanceId;
+    uint clusterId;
+    uint instanceMask;
+    uint instanceFlags;
+    uint blasHash;
+    uint geometryMask;
+    uint geometryType;
+    bool blasDescFound;
+    bool isClustered;
+    bool isEdge;
+};
+
+HitDesc _HitDesc()
+{
+    HitDesc h;
+    h.instanceDesc = _TlasInstanceDesc();
+    h.blasDesc = _ViewerBlasDescGPU();
+    h.geometryFlags = 0;
+
+    h.flatNormal = float3( 0.0, 0.0, 0.0 );
+    h.barycentrics = float2( 0.0, 0.0 );
+
+    h.primitiveId = 0;
+    h.instanceIndex = 0;
+    h.instanceContributionToHitGroupIndex = 0;
+    h.geometryIndex = 0;
+    h.instanceId = 0;
+    h.clusterId = 0;
+    h.instanceMask = 0;
+    h.instanceFlags = 0;
+    h.blasHash = 0xFFFFFFFF;
+    h.geometryMask = 0;
+    h.geometryType = 0;
+    h.blasDescFound = false;
+    h.isEdge = false;
+    h.isClustered = false;
+    return h;
+}
+
+void FillBlasInfo( inout HitDesc h )
+{
+    uint numBlasDescs = gConstants.numBlasDescs;
+
+    if( numBlasDescs < 1 && gConstants.blasMapCapacity < 1)
+        return;
+
+    bool found = false;
+    int iterator = 0;
+    {
+        int low = 0;
+        int high = int( numBlasDescs ) - 1;
+        while ( low <= high && numBlasDescs > 0 )
+        {
+            iterator = low + ( ( high - low ) / 2 );
+            found = h.blasHash == gBlasHashes[ iterator ];
+
+            if ( found )
+                break;
+
+            if ( gBlasHashes[ iterator ] < h.blasHash )
+                low = iterator + 1;
+            else
+                high = iterator - 1;
+        }
+    }
+
+    if( found )
+    {
+        h.blasDesc = ViewerBlasDescGPU_Init( gBlasDescs[ iterator ] );
+        h.isClustered = bool( h.blasDesc.flags & AS_BUILD_FLAG_CLUSTERED );
+        uint geometryDesc = 0;
+        geometryDesc = gGeometryDesc[ h.blasDesc.geometryOffset + h.geometryIndex ];
+        const uint flagMask = 0x3;
+        h.geometryFlags = geometryDesc & 0x3;
+
+        const uint typeBitShift = 2;
+        uint linearType = geometryDesc >> typeBitShift;
+
+        uint bitShift = linearType > 0 ? linearType - 1u : 0;
+        h.geometryType = ( linearType > 0 ) ? ( 1u << bitShift ) : 0;
+        h.blasDescFound = found;
+        return;
+    }
+
+#if defined HLSL
+    if( gConstants.blasMapCapacity == 0 )
+        return;
+
+    ClusteredBlasDescGPU blasDesc = _ClusteredBlasDescGPU();
+    if( BlasFind( U64toU2( h.instanceDesc.virtualGpuAddress ), blasDesc ) != true )
+        return;
+    
+    h.blasDesc.flags = blasDesc.flags | AS_BUILD_FLAG_CLUSTERED;
+    h.blasDesc.updateFrameId = blasDesc.updateFrameId;
+    h.isClustered = true;
+    h.geometryType = GEOMETRY_TYPE_CLUSTER_TRIANGLE;
+    h.blasDescFound = true;
+#endif
+}
+
+float3 GetPixelPosition( float3 worldPosition )
+{
+    float4 clipPos = mul( gConstants.worldToClip, float4( worldPosition, 1.0 ) );
+    float2 ndc = clipPos.xy / clipPos.w;
+    float2 uv = ndc * float2( 0.5, -0.5 ) + 0.5;
+    return float3( uv * gConstants.renderSize, clipPos.w );
+}
+
+float GetDistanceToTriangleEdge( float2 p0, float2 p1, float2 ph )
+{
+    float2 edge = p1 - p0;
+    float  edgeLenSq = max( dot( edge, edge ), 1e-12 );
+    float  t = saturate( dot( ph - p0, edge ) / edgeLenSq );
+    float2 foot = p0 + edge * t;
+    return length( ph - foot );
+}
+
+bool IsEdge( float3x3 worldPositions, float2 barycentrics )
+{
+    float3 hitPos = ( 1.0 - barycentrics.x - barycentrics.y ) * worldPositions[ 0 ]
+                  + barycentrics.x                            * worldPositions[ 1 ]
+                  + barycentrics.y                            * worldPositions[ 2 ];
+
+    float3 q0 = GetPixelPosition( worldPositions[ 0 ] );
+    float3 q1 = GetPixelPosition( worldPositions[ 1 ] );
+    float3 q2 = GetPixelPosition( worldPositions[ 2 ] );
+    float3 qh = GetPixelPosition( hitPos );
+
+    if ( min( min( q0.z, q1.z ), min( q2.z, qh.z ) ) <= 0.0 )
+        return false;
+
+    float d0 = GetDistanceToTriangleEdge( q0.xy, q1.xy, qh.xy );
+    float d1 = GetDistanceToTriangleEdge( q1.xy, q2.xy, qh.xy );
+    float d2 = GetDistanceToTriangleEdge( q2.xy, q0.xy, qh.xy );
+
+    const float edgeHalfWidthPixels = 0.66;
+    return min( d0, min( d1, d2 ) ) <= edgeHalfWidthPixels;
+}
+
+void HitDesc_ProcessCommon( inout HitDesc h )
+{
+    h.instanceDesc = gInstanceDescs[ h.instanceIndex ];
+    h.instanceMask = ( h.instanceDesc.Mask8InstanceID24Instance >> 24 ) & 0xFF;
+    h.instanceFlags = ( h.instanceDesc.Flags8InstanceContributionToHitGroupIndex24 >> 24 ) & 0xFF;
+    h.blasHash = HashFromGpuVirtualAddress( h.instanceDesc.virtualGpuAddress );
+    FillBlasInfo( h );
+    h.geometryMask = GetGeometryFlagMask( h.instanceFlags, h.blasDesc.flags, h.geometryFlags );
+}
+
+void HitDesc_ProcessCandidate( inout HitDesc h, RAY_QUERY rq )
+{
+    h.primitiveId =                         RayQueryCandidatePrimitiveIndex( rq );
+    h.instanceIndex =                       RayQueryCandidateInstanceIndex( rq );
+    h.instanceContributionToHitGroupIndex = RayQueryCandidateInstanceContributionToHitGroupIndex( rq );
+    h.geometryIndex =                       RayQueryCandidateGeometryIndex( rq );
+    h.instanceId =                          RayQueryCandidateInstanceID( rq );
+
+    h.geometryType = GEOMETRY_TYPE_TRIANGLE;
+    h.geometryType = RayQueryCandidateType( rq ) == CANDIDATE_PROCEDURAL_PRIMITIVE ? GEOMETRY_TYPE_AABB : h.geometryType;
+
+    #if defined( ENABLE_LSS )
+        h.geometryType = RayQueryCandidateIsSphere( rq ) ? GEOMETRY_TYPE_SPHERE : h.geometryType;
+        h.geometryType = RayQueryCandidateIsLss( rq ) ? GEOMETRY_TYPE_LSS : h.geometryType;
+    #endif // ENABLE_LSS
+
+    #if defined( ENABLE_POSITION_FETCH )
+        if(h.geometryType == GEOMETRY_TYPE_TRIANGLE && GetPackedBool( PACKED_BOOL_ENABLE_WIRE ) && GetPackedBool( PACKED_BOOL_ENABLE_FRAME ))
+        {
+            float3x3 positions = RayQueryCandidateTrianglePositions( rq );
+            float3x4 objectToWorld = RayQueryCandidateObjectToWorld( rq );
+            positions[ 0 ] = mul( objectToWorld, float4( positions[ 0 ], 1.0 ) ).xyz;
+            positions[ 1 ] = mul( objectToWorld, float4( positions[ 1 ], 1.0 ) ).xyz;
+            positions[ 2 ] = mul( objectToWorld, float4( positions[ 2 ], 1.0 ) ).xyz;
+            h.isEdge = IsEdge( positions, RayQueryCandidateTriangleBarycentrics( rq ) );
+        }
+    #endif // ENABLE_POSITION_FETCH
+
+    HitDesc_ProcessCommon( h );
+}
+
+void HitDesc_ProcessHit( inout HitDesc h, RAY_QUERY rayQuery )
+{
+    h.primitiveId =                         RayQueryCommittedPrimitiveIndex( rayQuery );
+    h.instanceIndex =                       RayQueryCommittedInstanceIndex( rayQuery );
+    h.instanceContributionToHitGroupIndex = RayQueryCommittedInstanceContributionToHitGroupIndex( rayQuery );
+    h.geometryIndex =                       RayQueryCommittedGeometryIndex( rayQuery );
+    h.instanceId =                          RayQueryCommittedInstanceID( rayQuery );
+    h.barycentrics =                        RayQueryCommittedTriangleBarycentrics( rayQuery ).xy;
+
+    #if defined( NV_GPU ) && defined( HLSL )
+        h.clusterId =                       RayQueryCommittedGetClusterIndex( rayQuery );
+    #endif
+
+    h.geometryType = GEOMETRY_TYPE_TRIANGLE;
+    h.geometryType = RayQueryCommittedStatus( rayQuery ) == COMMITTED_PROCEDURAL_PRIMITIVE_HIT ? GEOMETRY_TYPE_AABB : h.geometryType;
+
+    #if defined( ENABLE_LSS )
+        h.geometryType = RayQueryCommittedIsSphere( rayQuery ) ? GEOMETRY_TYPE_SPHERE : h.geometryType;
+        h.geometryType = RayQueryCommittedIsLss( rayQuery ) ? GEOMETRY_TYPE_LSS : h.geometryType;
+    #endif
+
+    float3 rayDir = RayQueryWorldRayDirection( rayQuery );
+    float3 hitPos = RayQueryWorldRayOrigin( rayQuery ) + rayDir * RayQueryCommittedRayT( rayQuery );
+
+    #if defined( ENABLE_POSITION_FETCH )
+        if( IsGeometryTriangle( h.geometryType) )
+        {
+            float3x3 positions = RayQueryCommittedTrianglePositions( rayQuery );
+            float3x4 objectToWorld = RayQueryCommittedObjectToWorld( rayQuery );
+            positions[ 0 ] = mul( objectToWorld, float4( positions[ 0 ], 1.0 ) ).xyz;
+            positions[ 1 ] = mul( objectToWorld, float4( positions[ 1 ], 1.0 ) ).xyz;
+            positions[ 2 ] = mul( objectToWorld, float4( positions[ 2 ], 1.0 ) ).xyz;
+            h.isEdge = IsEdge( positions, h.barycentrics );
+
+            float3 v1 = positions[ 1 ] - positions[ 0 ];
+            float3 v2 = positions[ 2 ] - positions[ 0 ];
+            h.flatNormal = normalize( cross( v1, v2 ) );
+            h.flatNormal *= dot( -rayDir, h.flatNormal ) >= 0.0 ? 1.0 : -1.0;
+        }
+    #endif // ENABLE_POSITION_FETCH
+
+    #if defined( ENABLE_LSS )
+        if( h.geometryType == GEOMETRY_TYPE_LSS )
+        {
+            float3x4 objectToWorld = RayQueryCommittedObjectToWorld( rayQuery );
+            const float2x4 lssObjectPosAndRadii = RayQueryCommittedLssPositionsAndRadii( rayQuery );
+            float3 pos0 = mul( objectToWorld, float4( lssObjectPosAndRadii[ 0 ].xyz, 1.0 ) ).xyz;
+            float3 pos1 = mul( objectToWorld, float4( lssObjectPosAndRadii[ 1 ].xyz, 1.0 ) ).xyz;
+            float3 pos = lerp( pos0, pos1, h.barycentrics.x );
+            h.flatNormal = normalize( hitPos - pos );
+        }
+    #endif // ENABLE_LSS
+
+    h.flatNormal = h.flatNormal * 0.5 + 0.5;
+
+    HitDesc_ProcessCommon( h );
+}
+
+uint HitDesc_GetSeed( HitDesc h, uint visMode )
+{
+    uint seed = 0;
+    switch ( visMode )
+    {
+        case VIS_MODE_PRIMITIVE_INDEX             : seed = h.primitiveId; break;
+        case VIS_MODE_GEOMETRY_INDEX              : seed = h.geometryIndex; break;
+        case VIS_MODE_INSTANCE_INDEX              : seed = h.instanceIndex; break;
+        case VIS_MODE_INSTANCE_ID                 : seed = h.instanceId; break;
+        case VIS_MODE_CONTRIBUTION_TO_HIT_GROUP   : seed = h.instanceContributionToHitGroupIndex; break;
+        case VIS_MODE_CLUSTER_ID                  : seed = h.clusterId; break;
+        case VIS_MODE_BLAS_ADDRESS                : seed = h.blasHash; break;
+        case VIS_MODE_INSTANCE_MASK               : seed = h.instanceMask; break;
+        case VIS_MODE_INSTANCE_FLAGS              : seed = h.instanceFlags; break;
+        default: break;
+    }
+    return seed;
+}
+
+float3 HitDesc_GetColor( HitDesc h, uint visMode )
+{
+    uint hash = HitDesc_GetSeed( h, visMode );
+    RNG_Initialize( hash, 0 );
+    return RNG_GetFloat3().xyz * 0.9;
+}
+
+////////////////////////////////////////////////////////////////////////
+void UpdateReadback( uint2 threadId, HitDesc hitDesc, RayDesc rayDesc, float maxT, bool requestAABBSearch )
+{
+    if ( threadId.x != gConstants.mousePos.x || threadId.y != gConstants.mousePos.y )
+        return;
+
+    if ( requestAABBSearch )
+    {
+        rayDesc.TMax = maxT;
+        RAY_QUERY proceduralQuery;
+
+        bool busy = true;
+        const uint maxNumAttempts = 25;
+        uint attemptCounter = 0;
+        while ( busy && attemptCounter < maxNumAttempts )
+        {
+            uint aabbCounter = 0;
+            ++attemptCounter;
+            RayQueryTraceRayInline( proceduralQuery, gTLAS, RAY_FLAG_SKIP_TRIANGLES | RAY_FLAG_FORCE_OPAQUE, gConstants.instanceInclusionMask, rayDesc );
+
+            while ( RayQueryProceed( proceduralQuery ) )
+            {
+                if ( ++aabbCounter > 1 )
+                {
+                    maxT *= 0.5;
+                    RayQueryAbort( proceduralQuery );
+                }
+                HitDesc_ProcessCandidate( hitDesc, proceduralQuery );
+            }
+
+            if ( aabbCounter == 0 )
+            {
+                maxT *= 1.5;
+                continue;
+            }
+
+            busy = aabbCounter == 1;
+        }
+    }
+
+    const uint geometryIndex = hitDesc.isClustered ? hitDesc.clusterId : hitDesc.geometryIndex;
+    FeedbackBufferLayout readBack = _FeedbackBufferLayout();
+    readBack.blasHash = hitDesc.blasHash;
+    readBack.data = geometryIndex << 16;
+
+    uint instanceData = ( hitDesc.instanceDesc.Mask8InstanceID24Instance >> 24 ) & 0x000000FF;
+    instanceData = instanceData << 8;
+    instanceData |= ( ( hitDesc.instanceDesc.Flags8InstanceContributionToHitGroupIndex24 >> 24 ) & 0x000000FF );
+    readBack.data = readBack.data | instanceData;
+ 
+#if defined( HLSL )
+    if( hitDesc.isClustered )
+    {
+        ClusteredBlasDescGPU blasDesc = _ClusteredBlasDescGPU();
+        readBack.clusteredBlasAddr = hitDesc.instanceDesc.virtualGpuAddress;
+        BlasFind( U64toU2( hitDesc.instanceDesc.virtualGpuAddress ), readBack.clusteredBlas );
+    }
+#endif // HLSL
+
+    gReadback[ 0 ] = readBack;
+    return;
+}
+
+bool CheckGeometryMask( HitDesc hitDesc )
+{
+    const uint blasFlags = hitDesc.blasDesc.flags;
+    const uint geometryMask = hitDesc.geometryMask;
+    const uint flagMask = gConstants.flagMask;
+
+    const bool blasFlagsUnknown = bool( blasFlags & AS_BUILD_FLAG_UNKNOWN );
+    const bool blasFlagsRequested = bool( flagMask & ( AS_BUILD_FLAG_MASK << AS_BUILD_FLAG_MASK_SHIFT ) );
+    const bool ignoreFlags = blasFlagsRequested && blasFlagsUnknown;
+
+    if ( GetFlagFilterLogicalMode() == FLAG_LOGIC_OP_AND && GetFlagFilterInclusionMode() == FLAG_INC_MODE_INCLUDE )
+    { // has all of specified flags
+        return ( ( geometryMask & flagMask ) == flagMask ) && !ignoreFlags;
+    }
+    else if ( GetFlagFilterLogicalMode() == FLAG_LOGIC_OP_OR && GetFlagFilterInclusionMode() == FLAG_INC_MODE_INCLUDE )
+    {  // has any of specified flags
+        return bool( geometryMask & flagMask );
+    }
+    else if ( GetFlagFilterLogicalMode() == FLAG_LOGIC_OP_AND && GetFlagFilterInclusionMode() == FLAG_INC_MODE_EXCLUDE )
+    { // has none of specified flags
+        return ( ( geometryMask & flagMask ) == 0) && !ignoreFlags;
+    }
+    else if ( GetFlagFilterLogicalMode() == FLAG_LOGIC_OP_OR && GetFlagFilterInclusionMode() == FLAG_INC_MODE_EXCLUDE )
+    {  // doesn't have any of specified flags
+        return bool( ( geometryMask & flagMask ) == 0 );
+    }
+    return false;
+}
+
+float3 ColorByUpdateState( HitDesc hitDesc )
+{
+    const float3 unknownColor = float3( 0.3, 0.3, 0.3 );        // grey
+    const float3 staticColor = float3( 0.2, 0.5, 0.2 );         // green
+    const float3 rebuildColor = float3(0.9, 0.0, 0.0);          // red
+    const float3 refitColor = float3( 0.9, 0.5, 0.0 );          // orange
+    const float3 allowUpdateColor = float3( 0.75, 0.75, 0.0 );  // yellow
+
+    if( hitDesc.blasDescFound == false )
+        return unknownColor;
+
+    float3 result = staticColor;
+    const uint updateFrameId = hitDesc.blasDesc.updateFrameId;
+    const bool fresh = gConstants.frameId <= updateFrameId;
+    if( fresh )
+    {
+        const bool isRefit = bool( hitDesc.blasDesc.flags & AS_BUILD_FLAG_PERFORM_UPDATE );
+        result = isRefit ? refitColor : rebuildColor;
+	}
+    else if ( bool( hitDesc.blasDesc.flags & AS_BUILD_FLAG_ALLOW_UPDATE ) )
+    {
+        result = allowUpdateColor;
+    }
+    return result;
+}
+
+void GetSelectionColor( uint2 DTid, HitDesc hitDesc, inout float3 color )
+{
+    if ( hitDesc.blasHash != gConstants.lastSelectedBlasHash )
+        return;
+    // selection grid
+    const bool isSelectedGeometry = hitDesc.isClustered ? true : gConstants.lastSelectedGeometryId == hitDesc.geometryIndex;
+    const uint tileSize = 4;
+    uint2 tileId = uint2( DTid.x / tileSize, DTid.y / tileSize );
+    if ( ( tileId.x & 0x1 ) != ( tileId.y & 0x1 ) )
+    {
+        if(isSelectedGeometry)
+        {
+            float luma = dot( color, float3( 0.2126, 0.7152, 0.0722 ) );
+            color = saturate( lerp( float3( luma, luma, luma ), color, 1.5 ) );
+            color = lerp( color, float3( 1.0, 1.0, 1.0 ), 0.77 );
+        }
+        else
+            color *= 0.01;
+    }
+}
+
+uint GetTimestamp()
+{
+    #if defined( HLSL )
+        #if defined( NV_GPU )
+        {
+            return NvGetSpecial( NV_SPECIALOP_GLOBAL_TIMER_LO );
+        }
+        #elif defined( AMD_GPU )
+        {
+            return (uint)(AmdExtD3DShaderIntrinsics_ShaderClock() & 0xFFFFFFFF);
+        }
+        #endif
+    #elif defined( GLSL )
+    {
+        return clock2x32ARB().x;
+    }
+    #endif
+
+    return 0;
+}
+
+uint TimestampDiff( uint startTimestamp, uint endTimestamp )
+{ // from https://developer.nvidia.com/blog/profiling-dxr-shaders-with-timer-instrumentation/
+    // Account for (at most one) overflow
+    return endTimestamp >= startTimestamp ? ( endTimestamp - startTimestamp ) : ( ~0u - ( startTimestamp - endTimestamp ) );
+}
+
+float3 GetTemperatureColor( float t )
+{ // from https://developer.nvidia.com/blog/profiling-dxr-shaders-with-timer-instrumentation/
+    const float3 c[ 10 ] = {
+        float3(   0.0f / 255.0f,   2.0f / 255.0f,  91.0f / 255.0f ),
+        float3(   0.0f / 255.0f, 108.0f / 255.0f, 251.0f / 255.0f ),
+        float3(   0.0f / 255.0f, 221.0f / 255.0f, 221.0f / 255.0f ),
+        float3(  51.0f / 255.0f, 221.0f / 255.0f,   0.0f / 255.0f ),
+        float3( 255.0f / 255.0f, 252.0f / 255.0f,   0.0f / 255.0f ),
+        float3( 255.0f / 255.0f, 180.0f / 255.0f,   0.0f / 255.0f ),
+        float3( 255.0f / 255.0f, 104.0f / 255.0f,   0.0f / 255.0f ),
+        float3( 226.0f / 255.0f,  22.0f / 255.0f,   0.0f / 255.0f ),
+        float3( 191.0f / 255.0f,   0.0f / 255.0f,  83.0f / 255.0f ),
+        float3( 145.0f / 255.0f,   0.0f / 255.0f,  65.0f / 255.0f )
+    };
+
+    const float s = t * 10.0f;
+
+    const int cur = int( s ) <= 9 ? int( s ) : 9;
+    const int prv = cur >= 1 ? cur - 1 : 0;
+    const int nxt = cur < 9 ? cur + 1 : 9;
+
+    const float blur = 0.8f;
+
+    const float wc = smoothstep( float( cur ) - blur, float( cur ) + blur, s ) * ( 1.0f - smoothstep( float( cur + 1 ) - blur, float( cur + 1 ) + blur, s ) );
+    const float wp = 1.0f - smoothstep( float( cur ) - blur, float( cur ) + blur, s );
+    const float wn = smoothstep( float( cur + 1 ) - blur, float( cur + 1 ) + blur, s );
+
+    const float3 r = wc * c[ cur ] + wp * c[ prv ] + wn * c[ nxt ];
+    return saturate( r );
+}
+
+float3 GetProfilingColor( uint beginTimestamp, uint endTimestamp )
+{
+    uint deltaTimestamp = TimestampDiff( beginTimestamp, endTimestamp );
+    const float heatmapScale = 65000.0 * gConstants.heatmapScaling;
+    float deltaTimestampScaled = saturate( float( deltaTimestamp ) / heatmapScale );
+    return GetTemperatureColor( deltaTimestampScaled );
+}
+
+RayDesc PreparePrimaryRay( uint2 pixelPos )
+{
+    float2 pixelUv = float2( pixelPos.xy + 0.5 ) * gConstants.invRenderSize;
+    float3 cameraRayOriginv = ReconstructViewPosition( pixelUv, gConstants.frustum, 0.001, 0.0 );
+    float3 cameraRayOrigin = AffineTransform( gConstants.viewToWorld, cameraRayOriginv );
+    float3 cameraRayDirection = normalize( RotateVector( gConstants.viewToWorld, cameraRayOriginv ) );
+
+    RayDesc rayDesc;
+    rayDesc.Origin = cameraRayOrigin;
+    rayDesc.Direction = cameraRayDirection;
+    rayDesc.TMin = 0.0;
+    rayDesc.TMax = 999999.0;
+    return rayDesc;
+}
+
+////////////////////////////////////////////////////////////////////////
+#define X_SIZE BVH_VIZ_SHDR_X
+#define Y_SIZE BVH_VIZ_SHDR_Y
+BEGIN_MAIN( DECLARE_THREAD_GROUP_SIZE( X_SIZE, Y_SIZE, 1 ), INIT_DISPATCH_THREAD_ID_SEMANTIC( uint3, DTid ) )
+{
+    if( DTid.x > uint( gConstants.renderSize.x ) || DTid.y > uint( gConstants.renderSize.y ) )
+        return;
+
+    float3 color = float3( 0.1, 0.1, 0.1 );
+    float3 aabbColor = color;
+    float3 perfColor = float3(0.0, 0.0, 0.0);
+    float proceduralInvFactor = 1.0;
+
+    const uint visMode = gConstants.visualizationMode;
+    const bool onlyInstanceFlagsSpecified = ( gConstants.flagMask & ( INSTANCE_FLAG_MASK << INSTANCE_FLAG_MASK_SHIFT ) ) == gConstants.flagMask;
+    const bool geometryFlagsSpecified = bool( gConstants.flagMask & ( GEOMETRY_FLAG_MASK << GEOMETRY_FLAG_MASK_SHIFT ) );
+    const bool enableFlagFilter = gConstants.flagMask != 0 && GetFlagFilterVisualizationMode() == FLAG_VIS_MODE_SHOW;
+    const bool enableGeometryTypeFilter = IsGeometryTypeSet( GEOMETRY_TYPE_ALL ) == false;
+    const bool enableWireframe = GetPackedBool( PACKED_BOOL_ENABLE_WIRE ) && GetPackedBool( PACKED_BOOL_ENABLE_FRAME ); 
+    const uint numSamples = visMode == VIS_MODE_HEAT_MAP ? gConstants.numSamples : 1;
+
+    const bool enableBuiltinPrimitives =
+     IsGeometryTypeSet( GEOMETRY_TYPE_TRIANGLE ) ||
+     IsGeometryTypeSet( GEOMETRY_TYPE_OMM_TRIANGLE ) ||
+     IsGeometryTypeSet( GEOMETRY_TYPE_LSS ) ||
+     IsGeometryTypeSet( GEOMETRY_TYPE_CLUSTER_TRIANGLE ) ||
+     IsGeometryTypeSet( GEOMETRY_TYPE_SPHERE );
+
+    uint rayFlags = enableBuiltinPrimitives ? 0 : RAY_FLAG_SKIP_TRIANGLES;
+    rayFlags |= IsGeometryTypeSet( GEOMETRY_TYPE_AABB ) ? 0 : RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES;
+
+    const bool forceNonOpaque = enableFlagFilter || enableGeometryTypeFilter || enableWireframe;
+    rayFlags |= forceNonOpaque ? RAY_FLAG_FORCE_NON_OPAQUE : RAY_FLAG_FORCE_OPAQUE;
+    rayFlags |= GetPackedBool( PACKED_BOOL_CULL_OPAQUE ) ? RAY_FLAG_CULL_OPAQUE : 0;
+    rayFlags |= GetPackedBool( PACKED_BOOL_CULL_NON_OPAQUE ) ? RAY_FLAG_CULL_NON_OPAQUE : 0;
+    rayFlags |= GetPackedBool( PACKED_BOOL_CULL_BACK_FACE ) ? RAY_FLAG_CULL_BACK_FACING_TRIANGLES : 0;
+    rayFlags |= GetPackedBool( PACKED_BOOL_CULL_FRONT_FACE ) ? RAY_FLAG_CULL_FRONT_FACING_TRIANGLES : 0;
+
+    RayDesc rayDesc = PreparePrimaryRay( DTid.xy );
+    RAY_QUERY rayQuery;
+    for(uint i = 0; i < numSamples; ++i)
+    {
+        uint beginTimestamp = GetTimestamp();
+        bool hasHitAABB = false;
+        RayQueryTraceRayInline( rayQuery, gTLAS, rayFlags, gConstants.instanceInclusionMask, rayDesc );
+        while ( RayQueryProceed( rayQuery ) )
+        {
+            bool isAABB = ( RayQueryCandidateType( rayQuery ) == CANDIDATE_PROCEDURAL_PRIMITIVE );
+            if( ( isAABB || forceNonOpaque ) == false )
+                continue;
+
+            HitDesc hitDesc = _HitDesc();
+            HitDesc_ProcessCandidate( hitDesc, rayQuery );
+
+            bool acceptHit = true;
+            if( enableFlagFilter )
+            {
+                 // can't reject hit if not sure: 
+                 // 1. blas flags are missing, can't check properly
+                 // 2. geometry flags are not being tracked for clustered geometry
+                acceptHit = geometryFlagsSpecified && hitDesc.isClustered;
+                acceptHit = acceptHit || ( onlyInstanceFlagsSpecified == false && hitDesc.blasDescFound == false );
+                const bool geometryFlagsRequested = bool( gConstants.flagMask & ( GEOMETRY_FLAG_MASK << GEOMETRY_FLAG_MASK_SHIFT ) );
+                acceptHit = acceptHit || CheckGeometryMask( hitDesc );
+            }
+
+            if( acceptHit && enableGeometryTypeFilter )
+            {
+                acceptHit = IsGeometryTypeSet( hitDesc.geometryType );
+            }
+
+            if( acceptHit && enableWireframe && !isAABB )
+            {
+                acceptHit = hitDesc.isEdge;
+            }
+
+            if ( isAABB && acceptHit )
+            { // update aabb color
+                hasHitAABB = true;
+                acceptHit = false; // only triangles can be accepted. procedural hits require hitT, which can not be calculated here. Axis Aligned Bounding Boxes.
+            }
+
+            if( acceptHit )
+                RayQueryCommitNonOpaqueTriangleHit( rayQuery );
+        }
+        perfColor += GetProfilingColor( beginTimestamp, GetTimestamp() );
+
+        uint numAabbHits = 0;
+        if( hasHitAABB )
+        { // since hitT for AABB is unknown, trace ray from camera limited by hitT from the main traversal
+            RAY_QUERY proceduralRayQuery;
+            RayDesc proceduralRayDesc = rayDesc;
+            proceduralRayDesc.TMax = RayQueryCommittedRayT( rayQuery );
+            RayQueryTraceRayInline( proceduralRayQuery, gTLAS, RAY_FLAG_SKIP_TRIANGLES, gConstants.instanceInclusionMask, proceduralRayDesc );
+            while ( RayQueryProceed( proceduralRayQuery ) )
+            {
+                HitDesc hitDesc = _HitDesc();
+                HitDesc_ProcessCandidate( hitDesc, proceduralRayQuery );
+                g_HashSeed = HitDesc_GetSeed( hitDesc, visMode ) + 0x035F9F29;
+                float3 tmpColor = RNG_GetFloat3().xyz * 0.9;
+                GetSelectionColor( DTid.xy, hitDesc, tmpColor );
+                aabbColor += tmpColor;
+                proceduralInvFactor *= 0.75;
+                ++numAabbHits;
+            }
+        }
+        aabbColor /= max( float( numAabbHits ), 1.0 );
+    }
+    perfColor /= float( numSamples );
+
+    if ( RayQueryCommittedStatus( rayQuery ) == COMMITTED_NOTHING )
+    {
+        UpdateReadback( DTid.xy, _HitDesc(), rayDesc, RayQueryCommittedRayT( rayQuery ), proceduralInvFactor < 1.0 );
+        color = lerp( aabbColor, color, proceduralInvFactor );
+        color = visMode == VIS_MODE_HEAT_MAP ? perfColor : color;
+        Image2dStore( gOutput, DTid.xy, float4( color, 1.0 ) );
+        return;
+    }
+
+    HitDesc hitDesc = _HitDesc();
+    HitDesc_ProcessHit( hitDesc, rayQuery );
+    UpdateReadback( DTid.xy, hitDesc, rayDesc, RayQueryCommittedRayT( rayQuery ), proceduralInvFactor < 1.0 );
+
+    bool enableShading = true;
+    switch ( visMode )
+    {
+    case VIS_MODE_HEAT_MAP: color = perfColor; enableShading = false; break;
+    case VIS_MODE_FLAT_NORMAL: color = hitDesc.flatNormal; enableShading = false; break;
+    case VIS_MODE_UPDATE_STATE: color = ColorByUpdateState( hitDesc );  break;
+    default: color = HitDesc_GetColor( hitDesc, visMode );
+    }
+
+    if ( visMode != VIS_MODE_HEAT_MAP && ( gConstants.flagMask != 0 ) )
+    {
+        const bool hasUnknownBlasFlag = bool( hitDesc.blasDesc.flags & AS_BUILD_FLAG_UNKNOWN );
+        const bool blasFlagsRequested = bool( gConstants.flagMask & ( AS_BUILD_FLAG_MASK << AS_BUILD_FLAG_MASK_SHIFT ) );
+        const bool geometryFlagsRequested = bool( gConstants.flagMask & ( GEOMETRY_FLAG_MASK << GEOMETRY_FLAG_MASK_SHIFT ) );
+        const bool cantResolveBlasFlags = blasFlagsRequested && hasUnknownBlasFlag;
+        const bool cantResolveGeometryFlags = geometryFlagsRequested && hitDesc.isClustered;
+        const bool markAsNoData = cantResolveBlasFlags || cantResolveGeometryFlags;
+        if ( ( hitDesc.blasDescFound || onlyInstanceFlagsSpecified ) && !markAsNoData )
+        {
+            if ( !CheckGeometryMask( hitDesc ) )
+                color *= 0.3;
+        }
+        else
+            color = float3( 0.2, 0.2, 0.2 );
+    }
+
+    GetSelectionColor( DTid.xy, hitDesc, color );
+
+    if ( enableShading )
+    {
+        float3 baseColor = color;
+        if( GetPackedBool( PACKED_BOOL_ENABLE_BARY ) || hitDesc.geometryType == GEOMETRY_TYPE_LSS )
+        {
+            const float remap = 0.8;
+            float modifier = hitDesc.barycentrics.x + hitDesc.barycentrics.y;
+            modifier = remap + ( 1.0 - remap ) * modifier;
+            color *= modifier;
+        }
+
+        if( IsGeometryTriangle( hitDesc.geometryType ) && ( GetPackedBool( PACKED_BOOL_ENABLE_WIRE ) && !GetPackedBool( PACKED_BOOL_ENABLE_FRAME ) ) )
+        {
+            color = hitDesc.isEdge ? baseColor * 0.75 : color;
+        }
+
+        color = lerp( aabbColor, color, proceduralInvFactor );
+    }
+
+    Image2dStore( gOutput, DTid.xy, float4( color, 1.0 ) );
+}
+END_MAIN

@@ -1,0 +1,110 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ *
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
+ 
+#if defined( HLSL )
+#error "This Shader is GLSL only"
+#else // GLSL
+#extension GL_ARB_shading_language_include : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference2 : enable
+#include "GLSL_Bridge.h"
+#endif
+
+#include "CPU_Bridge.h"
+
+////////////////////////////////////////////////////////////////////////
+PUSH_CONSTANTS_BINDING( PUSH_CONSTANTS_LAYOUT, gConstants, 0 )
+STORAGE_STRUCTURED_BUFFER_BINDING( TlasInstanceDesc, outInstanceDescs, 0 )
+
+BUFFER_REFERENCE( uint, gIndirecOpsCount, 8 )
+BUFFER_REFERENCE( IndirectOpDesc, gIndirectOpsBuffer, 8 )
+BUFFER_REFERENCE( WriteInstanceOpDesc, gInstanceWriteOps, 8 )
+BUFFER_REFERENCE( UpdateInstanceOpDesc, gInstanceUpdateOps, 8 )
+
+////////////////////////////////////////////////////////////////////////
+#define X_SIZE OP_PARSE_SHDR_X
+#define Y_SIZE OP_PARSE_SHDR_Y
+BEGIN_MAIN( DECLARE_THREAD_GROUP_SIZE( X_SIZE, Y_SIZE, 1 ), INIT_DISPATCH_THREAD_ID_SEMANTIC( uint3, DTid ) )
+{
+    const uint id = DTid.x;
+    const uint numInstances = gConstants.numInstances;
+    if( id >= numInstances || numInstances == 0 )
+        return;
+
+    INIT_BUFFER_REFERENCE( uint, gIndirecOpsCount, gConstants.indirectOpsCountAddress )
+
+    const uint numIndirectOps = gIndirecOpsCount.data[ 0 ];
+    if( numIndirectOps == 0 )
+        return;
+
+    INIT_BUFFER_REFERENCE( IndirectOpDesc, gIndirectOpsBuffer, gConstants.indirectOpsBufferAddress )
+
+    const uint threadPoolSize = numInstances / numIndirectOps;
+    const uint threadPoolId = id / threadPoolSize;
+    if( threadPoolId >= numIndirectOps )
+        return;
+
+    ////////////////////////////////////////////////////////////////////////
+    IndirectOpDesc indirectOpsDesc =  gIndirectOpsBuffer.data[ threadPoolId ];
+    const uint type = indirectOpsDesc.type;
+    if( indirectOpsDesc.type == 2 )
+        return;
+
+    const uint indirectOpsArraySize = indirectOpsDesc.count;
+    const uint threadLinearIdInPool = id % threadPoolSize;
+    if( threadLinearIdInPool >= indirectOpsArraySize )
+        return;
+
+    const uint numOpsPerThread = ( indirectOpsArraySize + threadPoolSize - 1 ) / threadPoolSize;
+    const uint64_t dataAddress = indirectOpsDesc.data;
+    if( type == 0 ) // write instance
+    {
+        INIT_BUFFER_REFERENCE( WriteInstanceOpDesc, gInstanceWriteOps, dataAddress );
+        for( uint i = 0; i < numOpsPerThread; ++i )
+        {
+            const uint jobId = threadLinearIdInPool * numOpsPerThread + i;
+            if( jobId >= indirectOpsArraySize )
+                break;
+
+            const WriteInstanceOpDesc writeOp = gInstanceWriteOps.data[ jobId ];
+            TlasInstanceDesc instanceDesc;
+            instanceDesc.Transform = writeOp.transform;
+            instanceDesc.Mask8InstanceID24Instance = ( writeOp.instanceMask & 0xFF ) << 24;
+            instanceDesc.Mask8InstanceID24Instance |= writeOp.instanceID & 0xFFFFFF;
+            instanceDesc.Flags8InstanceContributionToHitGroupIndex24 = ( writeOp.instanceFlags & 0xFF ) << 24;
+            instanceDesc.Flags8InstanceContributionToHitGroupIndex24 |= writeOp.instanceContributionToHitGroupIndex & 0xFFFFFF;
+            instanceDesc.virtualGpuAddress = writeOp.accelerationStructure;
+            outInstanceDescs[ writeOp.instanceIndex ] = instanceDesc;
+        }
+    }
+
+    if( type == 1 ) // update instance
+    {
+        INIT_BUFFER_REFERENCE( UpdateInstanceOpDesc, gInstanceUpdateOps, dataAddress );
+        for( uint i = 0; i < numOpsPerThread; ++i )
+        {
+            const uint jobId = threadLinearIdInPool * numOpsPerThread + i;
+            if( jobId >= indirectOpsArraySize )
+                break;
+            UpdateInstanceOpDesc updateOp = gInstanceUpdateOps.data[ jobId ];
+            TlasInstanceDesc instanceDesc = outInstanceDescs[ updateOp.instanceIndex ];
+            {
+                instanceDesc.Flags8InstanceContributionToHitGroupIndex24 |= ( updateOp.instanceContributionToHitGroupIndex & 0xFFFFFF );
+                instanceDesc.virtualGpuAddress = updateOp.accelerationStructure;
+                outInstanceDescs[ updateOp.instanceIndex ] = instanceDesc;
+            }
+        }
+    }
+}
+END_MAIN

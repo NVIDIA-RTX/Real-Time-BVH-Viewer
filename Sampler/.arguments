@@ -1,0 +1,35 @@
+{
+  "FileVersion": 2,
+  "Id": "8492afce-99a4-329e-8984-bfd9a2544434",
+  "Items": [
+    {
+      "Id": "c076678d-59d8-4066-af39-bb29d1aef25a",
+      "Command": "-t auto",
+      "DefaultChecked": true
+    },
+    {
+      "Id": "09f8e5de-2cb0-4443-9649-25dbccc93001",
+      "Command": "--target="
+    },
+    {
+      "Id": "a84bdb73-9561-4087-8643-a7b72909261e",
+      "Command": "--inlineRendering"
+    },
+    {
+      "Id": "06f36e6f-1529-48ea-8f7d-3c7d569fd552",
+      "Command": "--forcePositionFetchExt"
+    },
+    {
+      "Id": "6bf17c6c-018a-49dc-9985-488bb4e41ef5",
+      "Command": "--disableVK"
+    },
+    {
+      "Id": "78c96573-f456-4f22-aa04-bd33760d2136",
+      "Command": "--disableD3D12"
+    },
+    {
+      "Id": "d7b58b18-51e7-42d3-a3aa-c45cf4b129bc",
+      "Command": "-w 1280 -h 720"
+    }
+  ]
+}

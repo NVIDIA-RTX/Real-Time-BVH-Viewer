@@ -1,0 +1,70 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ *
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
+ 
+#if defined( HLSL )
+
+#include "HLSL_Bridge.h"
+
+#else // GLSL
+
+#extension GL_ARB_shading_language_include : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference2 : enable
+
+#include "GLSL_Bridge.h"
+
+#endif
+
+#include "CPU_Bridge.h"
+
+struct InstanceDescRaw
+{
+    uint4 data[4];
+};
+
+////////////////////////////////////////////////////////////////////////
+
+PUSH_CONSTANTS_BINDING( PUSH_CONSTANTS_LAYOUT, gConstants, 0 )
+STORAGE_STRUCTURED_BUFFER_BINDING( InstanceDescRaw, outInstanceDescs, 0 )
+
+////////////////////////////////////////////////////////////////////////
+#if defined( HLSL )
+
+    STRUCTURED_BUFFER_BINDING( InstanceDescRaw, gInstanceDescs, 0 )
+    #define INIT_INSTANCE_BUFFER()
+    #define READ_INSTANCE_BUFFER( id ) gInstanceDescs[ id ]
+
+#else
+
+    BUFFER_REFERENCE( InstanceDescRaw, gInstanceDescs, 8 )
+    #define INIT_INSTANCE_BUFFER() INIT_BUFFER_REFERENCE( InstanceDescRaw, gInstanceDescs, gConstants.instanceDescBufferAddress )
+    #define READ_INSTANCE_BUFFER( id ) gInstanceDescs.data[ id ]
+
+#endif
+
+////////////////////////////////////////////////////////////////////////
+#define X_SIZE INST_COPY_SHDR_X
+#define Y_SIZE INST_COPY_SHDR_Y
+BEGIN_MAIN( DECLARE_THREAD_GROUP_SIZE( X_SIZE, Y_SIZE, 1 ), INIT_DISPATCH_THREAD_ID_SEMANTIC( uint3, DTid ) )
+{
+    const uint id = DTid.x;
+
+    if(gConstants.numInstances <= id )
+        return;
+
+    INIT_INSTANCE_BUFFER();
+    InstanceDescRaw instanceDesc = READ_INSTANCE_BUFFER( id );
+    outInstanceDescs[ id ] = instanceDesc;
+}
+END_MAIN

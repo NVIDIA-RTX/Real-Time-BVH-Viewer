@@ -1,0 +1,8 @@
+.vs
+BvhViewer/_External
+BvhViewer/_Build
+BvhViewer/_CompilationTest
+Sampler/_Build
+Sampler/_Bin
+Sampler/_External
+*aps

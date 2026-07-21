@@ -1,0 +1,100 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ *
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
+ 
+#if defined( HLSL )
+
+#include "HLSL_Bridge.h"
+
+#else // GLSL
+
+#extension GL_ARB_shading_language_include : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference2 : enable
+
+#include "GLSL_Bridge.h"
+
+#endif
+
+#include "CPU_Bridge.h"
+#include "HashMap.h"
+
+////////////////////////////////////////////////////////////////////////
+RAW_BUFFER_BINDING( inIndirectOpsCount, 0 )
+RAW_BUFFER_BINDING( inInputsBuffer, 1 )
+RAW_BUFFER_BINDING( inExplicitAddressBuffer, 2 )
+
+PUSH_CONSTANTS_BINDING( MULTI_INDIRECT_PUSH_CONSTANTS, gConstants, 0 )
+
+STORAGE_STRUCTURED_BUFFER_BINDING( uint,             inTemplateKey,  0 )
+STORAGE_STRUCTURED_BUFFER_BINDING( ClasBuildDescGPU, inTemplateData, 1 )
+
+STORAGE_STRUCTURED_BUFFER_BINDING( uint,             inClasKey,  2 )
+STORAGE_STRUCTURED_BUFFER_BINDING( ClasBuildDescGPU, inClasData, 3 )
+
+STORAGE_STRUCTURED_BUFFER_BINDING( uint,                 inBlasKey,  4 )
+STORAGE_STRUCTURED_BUFFER_BINDING( ClusteredBlasDescGPU, inBlasData, 5 )
+
+////////////////////////////////////////////////////////////////////////
+HASH_MAP_IMPLEMENTATION( Template, inTemplateKey, inTemplateData, ClasBuildDescGPU, gConstants.templateMapCapacity )
+HASH_MAP_IMPLEMENTATION( Clas, inClasKey, inClasData, ClasBuildDescGPU, gConstants.clasMapCapacity )
+HASH_MAP_IMPLEMENTATION( Blas, inBlasKey, inBlasData, ClusteredBlasDescGPU, gConstants.blasMapCapacity )
+
+////////////////////////////////////////////////////////////////////////
+#define X_SIZE CLAS_PARSE_SHDR_X
+#define Y_SIZE CLAS_PARSE_SHDR_Y
+BEGIN_MAIN( DECLARE_THREAD_GROUP_SIZE( X_SIZE, Y_SIZE, 1 ), INIT_DISPATCH_THREAD_ID_SEMANTIC( uint3, DTid ) )
+{
+    const uint id = DTid.x;
+
+    const uint maxCount = gConstants.maxArgCount;
+    uint count = maxCount;
+    if( gConstants.originalCountBufferAddr != 0 )
+        count = min( inIndirectOpsCount.Load( 0 ), maxCount );
+
+    if( count <= id )
+        return;
+
+    const uint inputStride = ( uint )gConstants.inputBufferStride;
+    uint readOffset = inputStride * id;
+    const uint2 srcAddr = inInputsBuffer.Load2( readOffset );
+    readOffset += 4 * 2;
+
+    const uint destinationBufferStride = ( uint )gConstants.destinationBufferStride;
+    const uint2 dstAddr = inExplicitAddressBuffer.Load2( destinationBufferStride * id );
+
+    if( gConstants.templateMapCapacity )
+    {
+        ClasBuildDescGPU templateDesc = _ClasBuildDescGPU();
+        if( TemplateFind( srcAddr, templateDesc ) == true )
+            TemplateInsert( dstAddr, templateDesc );
+        return;
+    }
+
+    if( gConstants.clasMapCapacity )
+    {
+        ClasBuildDescGPU clasDesc = _ClasBuildDescGPU();
+        if( ClasFind( srcAddr, clasDesc ) == true )
+            ClasInsert( dstAddr, clasDesc );
+        return;
+    }
+
+    if( gConstants.blasMapCapacity )
+    {
+        ClusteredBlasDescGPU blasDesc = _ClusteredBlasDescGPU();
+        if( BlasFind( srcAddr, blasDesc ) == true )
+            BlasInsert( dstAddr, blasDesc );
+        return;
+    }
+}
+END_MAIN

@@ -1,0 +1,108 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ *
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
+ 
+#if defined( HLSL )
+#include "HLSL_Bridge.h"
+#else // GLSL
+#extension GL_ARB_shading_language_include : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference2 : enable
+#include "GLSL_Bridge.h"
+#endif
+
+#include "CPU_Bridge.h"
+#include "HashMap.h"
+
+////////////////////////////////////////////////////////////////////////
+RAW_BUFFER_BINDING( inIndirectOpsCount, 0 )
+RAW_BUFFER_BINDING( inInputsBuffer, 1 )
+RAW_BUFFER_BINDING( inExplicitAddressBuffer, 2 ) // BLAS targets
+
+PUSH_CONSTANTS_BINDING( MULTI_INDIRECT_PUSH_CONSTANTS, gConstants, 0 );
+
+RAW_BUFFER_STORAGE_BINDING( outArgBuffer, 0 )
+
+STORAGE_STRUCTURED_BUFFER_BINDING( uint,                 inBlasKey,  1 )
+STORAGE_STRUCTURED_BUFFER_BINDING( ClusteredBlasDescGPU, inBlasData, 2 )
+
+////////////////////////////////////////////////////////////////////////
+HASH_MAP_IMPLEMENTATION( Blas, inBlasKey, inBlasData, ClusteredBlasDescGPU, gConstants.blasMapCapacity )
+
+////////////////////////////////////////////////////////////////////////
+#define X_SIZE CLAS_PARSE_SHDR_X
+#define Y_SIZE CLAS_PARSE_SHDR_Y
+BEGIN_MAIN( DECLARE_THREAD_GROUP_SIZE( X_SIZE, Y_SIZE, 1 ), INIT_DISPATCH_THREAD_ID_SEMANTIC( uint3, DTid ) )
+{
+    const uint id = DTid.x;
+
+    const uint maxCount = gConstants.maxArgCount;
+    uint count = maxCount;
+    if( gConstants.originalCountBufferAddr != 0 )
+        count = min( inIndirectOpsCount.Load( 0 ), maxCount );
+
+    if( id >= maxCount )
+        return;
+
+    const uint outputByteStride = ( 2 + 2 + 6 ) * 4; // 2 uint64, 6 uint
+    if( id >= count )
+    { // ExecuteIndirect runs maxArgCount commands, unused slots must be empty dispatches
+        const uint emptyOffset = outputByteStride * id;
+        outArgBuffer.Store4( emptyOffset + 0 + 0, uint4( 0, 0, 0, 0 ) );
+        outArgBuffer.Store4( emptyOffset + 4 * 4, uint4( 0, 0, 0, 0 ) );
+        outArgBuffer.Store2( emptyOffset + 4 * 8, uint2( 0, 0 ) );
+        return;
+    }
+
+    uint byteOffset = id * gConstants.inputBufferStride;
+    uint2 blob0 = inInputsBuffer.Load2( byteOffset ); byteOffset += 2 * 4;
+    uint2 blob1 = inInputsBuffer.Load2( byteOffset ); byteOffset += 2 * 4;
+
+    const uint destinationBufferStride = ( uint )gConstants.destinationBufferStride;
+    const uint2 dstBlasAddr = inExplicitAddressBuffer.Load2( destinationBufferStride * id );
+
+    struct BlasBuildArgDesc
+    {
+        uint clusterCount;
+        uint reserved;
+        uint64_t clusterVAs;
+    };
+
+    BlasBuildArgDesc inArg;
+    inArg.clusterCount = blob0.x;
+    inArg.reserved = 0;
+    inArg.clusterVAs = U2toU64( blob1 );
+
+    MultiIndirectBlasBuildArgs outArgs = _MultiIndirectBlasBuildArgs();
+    outArgs.clasBufferAddr = inArg.clusterVAs;
+    outArgs.dstBlasAddr = U2toU64( dstBlasAddr );
+    outArgs.clasCount = inArg.clusterCount;
+    outArgs.dispatchId = id;
+    outArgs.threadCountX = DivideRoundUp( max( outArgs.clasCount, 1 ), CLAS_PARSE_SHDR_X );
+    outArgs.threadCountY = 1;
+    outArgs.threadCountZ = 1;
+    outArgs.pad = 0;
+
+    {
+        uint outputOffset = outputByteStride * id;
+        outArgBuffer.Store2( outputOffset, U64toU2( outArgs.clasBufferAddr ) );                   outputOffset += 4 * 2;
+        outArgBuffer.Store2( outputOffset, U64toU2( outArgs.dstBlasAddr ) );                      outputOffset += 4 * 2;
+        outArgBuffer.Store2( outputOffset, uint2( outArgs.clasCount, outArgs.dispatchId ) );      outputOffset += 4 * 2;
+        outArgBuffer.Store2( outputOffset, uint2( outArgs.threadCountX, outArgs.threadCountY ) ); outputOffset += 4 * 2;
+        outArgBuffer.Store2( outputOffset, uint2( outArgs.threadCountZ, outArgs.pad ) );          outputOffset += 4 * 2;
+    }
+
+    ClusteredBlasDescGPU zeroData = _ClusteredBlasDescGPU();
+    BlasInsert( dstBlasAddr, zeroData );
+}
+END_MAIN

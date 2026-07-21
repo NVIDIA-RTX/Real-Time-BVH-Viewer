@@ -1,0 +1,100 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ *
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
+ 
+#if defined( HLSL )
+
+#include "HLSL_Bridge.h"
+
+#else // GLSL
+
+#extension GL_ARB_shading_language_include : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference2 : enable
+
+#include "GLSL_Bridge.h"
+
+#endif
+
+#include "CPU_Bridge.h"
+#include "HashMap.h"
+
+struct InstantiationArgDesc
+{
+    uint32_t clusterIdOffset;
+    uint32_t geometryIndexOffset;
+    uint64_t clusterTemplateAddr;
+    uint64_t vertexBufferAddr;
+    uint64_t vertexBufferStride;
+};
+
+////////////////////////////////////////////////////////////////////////
+RAW_BUFFER_BINDING( inIndirectOpsCount, 0 )
+RAW_BUFFER_BINDING( inInputsBuffer, 1 )
+RAW_BUFFER_BINDING( inExplicitAddressBuffer, 2 )
+
+PUSH_CONSTANTS_BINDING( MULTI_INDIRECT_PUSH_CONSTANTS, gConstants, 0 )
+
+STORAGE_STRUCTURED_BUFFER_BINDING( uint,               inTemplateKey,  0 )
+STORAGE_STRUCTURED_BUFFER_BINDING( ClasBuildDescGPU,   inTemplateData, 1 )
+
+STORAGE_STRUCTURED_BUFFER_BINDING( uint,               outClasKey,     2 )
+STORAGE_STRUCTURED_BUFFER_BINDING( ClasBuildDescGPU,   outClasData,    3 )
+
+////////////////////////////////////////////////////////////////////////
+HASH_MAP_IMPLEMENTATION( Template, inTemplateKey, inTemplateData, ClasBuildDescGPU, gConstants.templateMapCapacity )
+HASH_MAP_IMPLEMENTATION( Clas, outClasKey, outClasData, ClasBuildDescGPU, gConstants.clasMapCapacity )
+
+////////////////////////////////////////////////////////////////////////
+#define X_SIZE CLAS_PARSE_SHDR_X
+#define Y_SIZE CLAS_PARSE_SHDR_Y
+BEGIN_MAIN( DECLARE_THREAD_GROUP_SIZE( X_SIZE, Y_SIZE, 1 ), INIT_DISPATCH_THREAD_ID_SEMANTIC( uint3, DTid ) )
+{
+    const uint id = DTid.x;
+
+    const uint maxCount = gConstants.maxArgCount;
+    uint count = maxCount;
+    if( gConstants.originalCountBufferAddr != 0 )
+        count = min( inIndirectOpsCount.Load( 0 ), maxCount );
+
+    if( count <= id )
+        return;
+
+    const uint inputStride = ( uint )gConstants.inputBufferStride;
+    const uint dataBegin = inputStride * id;
+
+    InstantiationArgDesc inDesc;
+    {
+        uint readOffset = dataBegin;
+        const uint4 rawData0 = inInputsBuffer.Load4( readOffset ); readOffset += 4 * 4;
+        const uint4 rawData1 = inInputsBuffer.Load4( readOffset ); readOffset += 4 * 4;
+        {
+            inDesc.clusterIdOffset = rawData0[ 0 ];
+            inDesc.geometryIndexOffset = rawData0[ 1 ];
+            inDesc.clusterTemplateAddr = UtoU64( rawData0[ 2 ], rawData0[ 3 ] );
+            inDesc.vertexBufferAddr = UtoU64( rawData1[ 0 ], rawData1[ 1 ] );
+            inDesc.vertexBufferStride = UtoU64( rawData1[ 2 ], rawData1[ 3 ] );
+        }
+    }
+
+    const uint destinationBufferStride = ( uint )gConstants.destinationBufferStride;
+    const uint2 addr = inExplicitAddressBuffer.Load2( destinationBufferStride * id );
+
+    ClasBuildDescGPU templateDesc = _ClasBuildDescGPU();
+    if( TemplateFind( U64toU2( inDesc.clusterTemplateAddr ), templateDesc ) != true )
+        return;
+
+    ClasBuildDescGPU clasDesc = templateDesc;
+    ClasInsert( addr, clasDesc );
+}
+END_MAIN

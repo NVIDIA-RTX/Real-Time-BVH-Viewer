@@ -1,0 +1,110 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ *
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
+ 
+#if defined( HLSL )
+#include "HLSL_bridge.h"
+#else // GLSL
+#extension GL_ARB_shading_language_include : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference2 : enable
+#include "GLSL_Bridge.h"
+#endif
+
+#include "CPU_Bridge.h"
+
+////////////////////////////////////////////////////////////////////////
+PUSH_CONSTANTS_BINDING( PTLAS_INDIRECT_PUSH_CONSTANTS_LAYOUT, gConstants, 0 )
+RAW_BUFFER_BINDING( inIndirectOpsData, 0 )
+STORAGE_STRUCTURED_BUFFER_BINDING( TlasInstanceDesc, outInstanceDescs, 0 )
+
+////////////////////////////////////////////////////////////////////////
+#define X_SIZE OP_PARSE_SHDR_X
+#define Y_SIZE OP_PARSE_SHDR_Y
+BEGIN_MAIN( DECLARE_THREAD_GROUP_SIZE( X_SIZE, Y_SIZE, 1 ), INIT_DISPATCH_THREAD_ID_SEMANTIC( uint3, DTid ) )
+{
+    const uint id = DTid.x;
+    const uint count = gConstants.count;
+    const uint type = gConstants.type;
+    const uint64_t stride = gConstants.stride;
+
+    if( id >= count )
+        return;
+
+    if( type == 2 ) // partion translation update is not tracked, currently don't see any need for it
+        return;
+
+    const int dataBegin = ( int )stride * ( int )id;
+    if( type == 0 ) // write instance
+    {
+        WriteInstanceOpDesc writeOp;
+        {
+            uint readOffset = dataBegin;
+            for( uint rowId = 0; rowId < 3; ++rowId )
+            {
+                float4 rowData = asfloat( inIndirectOpsData.Load4( readOffset ));
+                writeOp.transform[ rowId ][ 0 ] = rowData[ 0 ];
+                writeOp.transform[ rowId ][ 1 ] = rowData[ 1 ];
+                writeOp.transform[ rowId ][ 2 ] = rowData[ 2 ];
+                writeOp.transform[ rowId ][ 3 ] = rowData[ 3 ];
+                readOffset += 4 * 4;
+            }
+
+            for( uint varId = 0; varId < 6; ++varId )
+            {
+                writeOp.userAABB[ varId ] = asfloat( inIndirectOpsData.Load( readOffset ));
+                readOffset += 4;
+            }
+
+            writeOp.instanceID = inIndirectOpsData.Load( readOffset ); readOffset += 4;
+            writeOp.instanceMask = inIndirectOpsData.Load( readOffset ); readOffset += 4;
+            writeOp.instanceContributionToHitGroupIndex = inIndirectOpsData.Load( readOffset ); readOffset += 4;
+            writeOp.instanceFlags = inIndirectOpsData.Load( readOffset ); readOffset += 4;
+            writeOp.instanceIndex = inIndirectOpsData.Load( readOffset ); readOffset += 4;
+            writeOp.partitionIndex = inIndirectOpsData.Load( readOffset ); readOffset += 4;
+
+            uint2 addr = inIndirectOpsData.Load2( readOffset ); readOffset += 8;
+            writeOp.accelerationStructure = ( uint64_t )addr.x | ( ( uint64_t )addr.y << 32 );
+        }
+
+        TlasInstanceDesc instanceDesc;
+        instanceDesc.Transform = writeOp.transform;
+        instanceDesc.Mask8InstanceID24Instance = ( writeOp.instanceMask & 0xFF ) << 24; 
+        instanceDesc.Mask8InstanceID24Instance |= writeOp.instanceID & 0xFFFFFF;
+        instanceDesc.Flags8InstanceContributionToHitGroupIndex24 = ( writeOp.instanceFlags & 0xFF ) << 24;
+        instanceDesc.Flags8InstanceContributionToHitGroupIndex24 |= writeOp.instanceContributionToHitGroupIndex & 0xFFFFFF;
+        instanceDesc.virtualGpuAddress = writeOp.accelerationStructure;
+
+        outInstanceDescs[ writeOp.instanceIndex ] = instanceDesc;
+        return;
+    }
+
+    if( type == 1 ) // update instance
+    {
+        UpdateInstanceOpDesc updateOp;
+        {
+            uint readOffset = dataBegin;
+            updateOp.instanceIndex = inIndirectOpsData.Load( readOffset ); readOffset += 4;
+            updateOp.instanceContributionToHitGroupIndex = inIndirectOpsData.Load( readOffset ); readOffset += 4;
+            uint2 addr = inIndirectOpsData.Load2( readOffset ); readOffset += 8;
+            updateOp.accelerationStructure = ( uint64_t )addr.x | ( ( uint64_t )addr.y << 32 );
+        }
+
+        TlasInstanceDesc instanceDesc = outInstanceDescs[ updateOp.instanceIndex ];
+        {
+            instanceDesc.Flags8InstanceContributionToHitGroupIndex24 |= ( updateOp.instanceContributionToHitGroupIndex & 0xFFFFFF );
+            instanceDesc.virtualGpuAddress = updateOp.accelerationStructure;
+            outInstanceDescs[ updateOp.instanceIndex ] = instanceDesc;
+        }
+    }
+}
+END_MAIN

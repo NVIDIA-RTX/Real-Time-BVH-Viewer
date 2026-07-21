@@ -1,0 +1,144 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ *
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
+ 
+#if defined( HLSL )
+
+#include "HLSL_Bridge.h"
+
+#else // GLSL
+
+#extension GL_ARB_shading_language_include : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference2 : enable
+
+#include "GLSL_Bridge.h"
+
+#endif
+
+#include "CPU_Bridge.h"
+#include "HashMap.h"
+
+struct ClusterArgDesc
+{
+// uint4
+    uint clusterId;
+    uint clusterFlags;
+    uint triangleCount : 9;
+    uint vertexCount : 9;
+    uint positionTruncateBitCount : 6;
+    uint indexFormat : 4;
+    uint opacityMicromapIndexFormat : 4;
+    uint baseGeometryIndexAndFlags;
+// uint4
+    uint16_t indexBufferStride;
+    uint16_t vertexBufferStride;
+    uint16_t geometryIndexAndFlagsBufferStride;
+    uint16_t opacityMicromapIndexBufferStride;
+    uint64_t indexBuffer;
+// uint4
+    uint64_t vertexBuffer;
+    uint64_t geometryIndexAndFlagsBuffer;
+// uint4
+    uint64_t opacityMicromapArray;
+    uint64_t opacityMicromapIndexBuffer;
+    // instantiationBoundingBoxLimit is part of arguments data in case of BUILD_CLUSTER_TEMPLATES_FROM_TRIANGLES operation.
+    // not tracked, thus neglected
+    // uint64_t instantiationBoundingBoxLimit;
+};
+
+////////////////////////////////////////////////////////////////////////
+RAW_BUFFER_BINDING( inIndirectOpsCount, 0 )
+RAW_BUFFER_BINDING( inInputsBuffer, 1 )
+RAW_BUFFER_BINDING( inExplicitAddressBuffer, 2 )
+
+PUSH_CONSTANTS_BINDING( MULTI_INDIRECT_PUSH_CONSTANTS, gConstants, 0 )
+
+STORAGE_STRUCTURED_BUFFER_BINDING( uint,             TemplateKey,  0 )
+STORAGE_STRUCTURED_BUFFER_BINDING( ClasBuildDescGPU, TemplateData, 1 )
+
+STORAGE_STRUCTURED_BUFFER_BINDING( uint,             ClasKey,  2 )
+STORAGE_STRUCTURED_BUFFER_BINDING( ClasBuildDescGPU, ClasData, 3 )
+
+////////////////////////////////////////////////////////////////////////
+HASH_MAP_IMPLEMENTATION( Template, TemplateKey, TemplateData, ClasBuildDescGPU, gConstants.templateMapCapacity )
+HASH_MAP_IMPLEMENTATION( Clas, ClasKey, ClasData, ClasBuildDescGPU, gConstants.clasMapCapacity )
+
+////////////////////////////////////////////////////////////////////////
+#define X_SIZE CLAS_PARSE_SHDR_X
+#define Y_SIZE CLAS_PARSE_SHDR_Y
+BEGIN_MAIN( DECLARE_THREAD_GROUP_SIZE( X_SIZE, Y_SIZE, 1 ), INIT_DISPATCH_THREAD_ID_SEMANTIC( uint3, DTid ) )
+{
+    const uint id = DTid.x;
+
+    const uint maxCount = gConstants.maxArgCount;
+    uint count = maxCount;
+    if( gConstants.originalCountBufferAddr != 0 )
+        count = min( inIndirectOpsCount.Load( 0 ), maxCount );
+
+    if( count <= id )
+        return;
+
+    ClusterArgDesc inDesc;
+    {
+        const uint inputStride = ( uint )gConstants.inputBufferStride;
+        const uint dataBegin = inputStride * id;
+        uint readOffset = dataBegin;
+        {
+            const uint4 rawData = inInputsBuffer.Load4( readOffset ); readOffset += 4 * 4;
+            inDesc.clusterId = rawData[ 0 ];
+            inDesc.clusterFlags = rawData[ 1 ];
+            uint bitShift = 0;
+            inDesc.triangleCount              = ( rawData[ 2 ] >> bitShift ) & ( 0x1FF ); bitShift += 9;
+            inDesc.vertexCount                = ( rawData[ 2 ] >> bitShift ) & ( 0x1FF ); bitShift += 9;
+            inDesc.positionTruncateBitCount   = ( rawData[ 2 ] >> bitShift ) & ( 0x3F );  bitShift += 6;
+            inDesc.indexFormat                = ( rawData[ 2 ] >> bitShift ) & ( 0xF );   bitShift += 4;
+            inDesc.opacityMicromapIndexFormat = ( rawData[ 2 ] >> bitShift ) & ( 0xF );   bitShift += 4;
+            inDesc.baseGeometryIndexAndFlags =    rawData[ 3 ];
+        }
+        {
+            const uint4 rawData = inInputsBuffer.Load4( readOffset ); readOffset += 4 * 4;
+            inDesc.indexBufferStride = UtoU16Low( rawData[ 0 ] );
+            inDesc.vertexBufferStride = UtoU16High( rawData[ 0 ] );
+
+            inDesc.geometryIndexAndFlagsBufferStride = UtoU16Low( rawData[ 1 ] );
+            inDesc.opacityMicromapIndexBufferStride  = UtoU16High( rawData[ 1 ] );
+
+            inDesc.indexBuffer = UtoU64( rawData[ 2 ], rawData[ 3 ] );
+        }
+        {
+            const uint4 rawData = inInputsBuffer.Load4( readOffset ); readOffset += 4 * 4;
+            inDesc.vertexBuffer = UtoU64( rawData[ 0 ], rawData[ 1 ] );
+            inDesc.geometryIndexAndFlagsBuffer = UtoU64( rawData[ 2 ], rawData[ 3 ] );
+        }
+        {
+            const uint4 rawData = inInputsBuffer.Load4( readOffset ); readOffset += 4 * 4;
+            inDesc.opacityMicromapArray       = UtoU64( rawData[ 0 ], rawData[ 1 ] );
+            inDesc.opacityMicromapIndexBuffer = UtoU64( rawData[ 2 ], rawData[ 3 ] );
+        }
+    }
+
+    const uint destinationBufferStride = ( uint )gConstants.destinationBufferStride;
+    const uint2 addr = inExplicitAddressBuffer.Load2( destinationBufferStride * id );
+
+    ClasBuildDescGPU outData = _ClasBuildDescGPU();
+    outData.hasOmm        = uint32_t( inDesc.opacityMicromapArray != 0 ? 1 : 0 );
+    outData.triangleCount = uint32_t( inDesc.triangleCount );
+    outData.vertexCount   = uint32_t( inDesc.vertexCount );
+
+    if( gConstants.templateMapCapacity )
+        TemplateInsert( addr, outData );
+    else if( gConstants.clasMapCapacity )
+        ClasInsert( addr, outData );
+}
+END_MAIN

@@ -1,0 +1,108 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ *
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
+ 
+#if defined( HLSL )
+#include "HLSL_Bridge.h"
+#else // GLSL
+#extension GL_ARB_shading_language_include : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference2 : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_vote : enable
+#include "GLSL_Bridge.h"
+#endif
+
+#include "CPU_Bridge.h"
+#include "HashMap.h"
+
+#if defined( HLSL )
+    #define WAVE_SUM( x )           WaveActiveSum( x )
+    #define WAVE_ANY_TRUE( x )      WaveActiveAnyTrue( x )
+    #define WAVE_IS_FIRST_LANE()    WaveIsFirstLane()
+    #define ATOMIC_ADD( dest, x )   InterlockedAdd( dest, x )
+    #define ATOMIC_OR( dest, x )    InterlockedOr( dest, x )
+#else
+    #define WAVE_SUM( x )           subgroupAdd( x )
+    #define WAVE_ANY_TRUE( x )      subgroupAny( x )
+    #define WAVE_IS_FIRST_LANE()    subgroupElect()
+    #define ATOMIC_ADD( dest, x )   atomicAdd( dest, x )
+    #define ATOMIC_OR( dest, x )    atomicOr( dest, x )
+#endif
+
+////////////////////////////////////////////////////////////////////////
+PUSH_CONSTANTS_BINDING( MULTI_INDIRECT_BLAS_BUILD_PARSING_CONSTANTS, gDispatchConstants, 0 )
+PUSH_CONSTANTS_BINDING( MULTI_INDIRECT_PUSH_CONSTANTS, gConstants, 1 )
+
+RAW_BUFFER_BINDING( inIndirectOpsData, 0 )
+
+STORAGE_STRUCTURED_BUFFER_BINDING( uint,                 inClasKey,  0 )
+STORAGE_STRUCTURED_BUFFER_BINDING( ClasBuildDescGPU,     inClasData, 1 )
+
+STORAGE_STRUCTURED_BUFFER_BINDING( uint,                 inBlasKey,  2 )
+STORAGE_STRUCTURED_BUFFER_BINDING( ClusteredBlasDescGPU, inBlasData, 3 )
+
+////////////////////////////////////////////////////////////////////////
+HASH_MAP_IMPLEMENTATION( Clas, inClasKey, inClasData, ClasBuildDescGPU, gConstants.clasMapCapacity )
+HASH_MAP_IMPLEMENTATION( Blas, inBlasKey, inBlasData, ClusteredBlasDescGPU, gConstants.blasMapCapacity )
+
+////////////////////////////////////////////////////////////////////////
+#define X_SIZE CLAS_PARSE_SHDR_X
+#define Y_SIZE CLAS_PARSE_SHDR_Y
+BEGIN_MAIN( DECLARE_THREAD_GROUP_SIZE( X_SIZE, Y_SIZE, 1 ), INIT_DISPATCH_THREAD_ID_SEMANTIC( uint3, DTid ) )
+{
+    const uint id = DTid.x;
+    const uint count = gDispatchConstants.clasCount > gConstants.maxClasPerBlas ? gConstants.maxClasPerBlas : gDispatchConstants.clasCount;
+    const uint sizeofU64 = ( 2 * 4 );
+
+    if( id >= count )
+        return;
+
+    const uint blasSlot = BlasFindSlot( U64toU2( gDispatchConstants.dstBlasAddr ) );
+    if( blasSlot == HASH_MAP_INVALID_SLOT )
+        return;
+
+    const uint2 clasAddr = inIndirectOpsData.Load2( id * sizeofU64 );
+    ClasBuildDescGPU clasDesc = _ClasBuildDescGPU();
+    if( ClasFind( clasAddr, clasDesc ) != true )
+        return;
+
+
+    const uint numClusters = WAVE_SUM( 1u );
+    const uint numTriangles = WAVE_SUM( uint( clasDesc.triangleCount ) );
+    const uint numVertices = WAVE_SUM( uint( clasDesc.vertexCount ) );
+    const bool hasOmm = WAVE_ANY_TRUE( clasDesc.hasOmm != 0 );
+
+    if( WAVE_IS_FIRST_LANE() )
+    {
+        ATOMIC_ADD( inBlasData[ blasSlot ].numTriangles, numTriangles );
+        ATOMIC_ADD( inBlasData[ blasSlot ].numVertices, numVertices );
+        if( hasOmm )
+        {
+            ATOMIC_OR( inBlasData[ blasSlot ].flags, AS_BUILD_FLAG_HAS_OMM_CLUSTERS );
+            ATOMIC_ADD( inBlasData[ blasSlot ].numOmmClusters, numClusters );
+        }
+        else
+        {
+            ATOMIC_ADD( inBlasData[ blasSlot ].numClusters, numClusters );
+        }
+    }
+
+    if(id == 0)
+    {
+        inBlasData[ blasSlot ].updateFrameId = gConstants.frameId;
+        ATOMIC_OR( inBlasData[ blasSlot ].flags, uint( gConstants.buildFlags ) );
+    }
+}
+END_MAIN
