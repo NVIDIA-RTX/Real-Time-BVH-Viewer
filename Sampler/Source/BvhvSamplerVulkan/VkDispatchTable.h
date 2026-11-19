@@ -26,6 +26,8 @@
     VK_FUNC_MACRO(vkGetPhysicalDeviceSurfaceFormatsKHR)\
     VK_FUNC_MACRO(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)\
     VK_FUNC_MACRO(vkGetPhysicalDeviceSurfacePresentModesKHR)\
+    VK_FUNC_MACRO(vkGetPhysicalDeviceFeatures)\
+    VK_FUNC_MACRO(vkGetPhysicalDeviceFeatures2)\
     VK_FUNC_MACRO(vkEnumerateDeviceExtensionProperties)\
     VK_FUNC_MACRO(vkDestroyInstance)
 

@@ -201,6 +201,9 @@ private:
 
 uint64_t MultiIndirectTracker::GetResourceAddress(BvhViewerResources resource, const OpImmidiateContext& immidiateContext, const uint32_t bufferedFrameId)
 {
+    if(m_Device == nullptr)
+        return 0;
+
     auto GetReservedGPUVA = [&](ReservedBuffers bufferType)
         {
             return Get(bufferType).buffer.ptr->GetGPUVirtualAddress() + m_ReservedBufferOffsets[uint32_t(bufferType)][bufferedFrameId];
@@ -272,6 +275,9 @@ MultiIndirectTracker::OpImmidiateContext MultiIndirectTracker::GetImmidiateConte
     OpImmidiateContext result = {};
 
 #if defined( BVHVIEWER_ENABLE_NVAPI )
+    if(m_Device == nullptr)
+        return result;
+
     const NVAPI_D3D12_RAYTRACING_MULTI_INDIRECT_CLUSTER_OPERATION_DESC& desc = *reinterpret_cast<const NVAPI_D3D12_RAYTRACING_MULTI_INDIRECT_CLUSTER_OPERATION_DESC*>(opDesc);
     const NVAPI_D3D12_RAYTRACING_MULTI_INDIRECT_CLUSTER_OPERATION_INPUTS& inputs = desc.inputs;
     const uint32_t bufferedFrameId = frameId % m_NumBufferedFrames;
@@ -349,6 +355,9 @@ void MultiIndirectTracker::Append(ID3D12GraphicsCommandList4* commandList, const
     (void)bufferedFrameId;
 
 #if defined( BVHVIEWER_ENABLE_NVAPI )
+    if(m_Device == nullptr)
+        return;
+
     m_KnownCommandLists.insert(uint64_t(commandList));
 
     const NVAPI_D3D12_RAYTRACING_MULTI_INDIRECT_CLUSTER_OPERATION_DESC& desc = *reinterpret_cast<const NVAPI_D3D12_RAYTRACING_MULTI_INDIRECT_CLUSTER_OPERATION_DESC*>(opDesc);
@@ -428,7 +437,7 @@ void MultiIndirectTracker::CommitReservedBufferMemory(ID3D12CommandQueue* queue,
 
 void MultiIndirectTracker::CommitMemory(ID3D12CommandQueue* queue, const uint32_t bufferedFrameId)
 {
-    if(queue == nullptr)
+    if(queue == nullptr || m_Device == nullptr)
         return;
 
     for(uint32_t bufferId = 0; bufferId < uint32_t(ReservedBuffers::Count); ++bufferId)
@@ -550,6 +559,9 @@ bool MultiIndirectTracker::Initialize(ID3D12Device* device, const uint32_t numBu
 
 void MultiIndirectTracker::Reset(const uint32_t bufferedFrameId)
 {
+    if(m_Device == nullptr)
+        return;
+
     for (uint32_t bufferId = 0; bufferId < uint32_t(ReservedBuffers::Count); ++bufferId)
         m_ReservedBufferOffsets[bufferId][bufferedFrameId] = 0;
 }
@@ -2388,7 +2400,8 @@ void InternalContext::DestroyBackend()
 
     m_MultiIndirectTracker.Destroy();
 
-    if(m_PresenterReady) ImGui_ImplDX12_Shutdown();
+    if(m_PresenterReady && ImGui::GetCurrentContext() && ImGui::GetIO().BackendRendererUserData)
+        ImGui_ImplDX12_Shutdown();
 
     for (auto& descriptor : m_BackBufferRtvDescriptors)
         descriptor = {};

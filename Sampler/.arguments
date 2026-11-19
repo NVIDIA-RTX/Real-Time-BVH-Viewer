@@ -13,11 +13,8 @@
     },
     {
       "Id": "a84bdb73-9561-4087-8643-a7b72909261e",
-      "Command": "--inlineRendering"
-    },
-    {
-      "Id": "06f36e6f-1529-48ea-8f7d-3c7d569fd552",
-      "Command": "--forcePositionFetchExt"
+      "Command": "--inlineRendering",
+      "DefaultChecked": true
     },
     {
       "Id": "6bf17c6c-018a-49dc-9985-488bb4e41ef5",

@@ -12,6 +12,7 @@
 
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
+#include <vulkan/vk_enum_string_helper.h>
 #include <unordered_map>
 #include <atomic>
 #include <string>
@@ -142,6 +143,309 @@ void VKAPI_CALL BvhvSampler_vkDestroyDevice(VkDevice device, const VkAllocationC
     delete deviceData;
 }
 
+///////////////////////////////////////////////
+struct FeatureState
+{
+    bool isSupported; // physical support
+    bool isChained;   // is appended by the app
+    bool isEnabled;   // is also enabled
+};
+
+enum class MinVkFeatures : uint8_t
+{
+    Rtas,
+    RayQuery,
+    Storage16Bit,
+    DeviceAddr,
+    ShaderClock,
+    CoreFeatures,
+    Count,
+};
+
+enum class OptVkFeatures : uint8_t
+{
+    PositionFetch,
+    Lss,
+    Ptlas,
+    DescriptorBuffer,
+    Maintenance5,
+    Count,
+    MINREQ = 0xFF,
+};
+
+bool CheckVkFeaturePhysicalSupport(VkPhysicalDevice physicalDevice, VulkanDispatchTable& dt, FeatureState* minFeatureStates, FeatureState* optFeatureStates)
+{
+    // minimal
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR rtasFeature = {};
+    rtasFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+    rtasFeature.pNext = nullptr;
+
+    VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeature = {};
+    rayQueryFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+    rayQueryFeature.pNext = &rtasFeature;
+
+    VkPhysicalDevice16BitStorageFeatures storage16BitFeature = {};
+    storage16BitFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+    storage16BitFeature.pNext = &rayQueryFeature;
+
+    VkPhysicalDeviceShaderClockFeaturesKHR shaderClockFeature = {};
+    shaderClockFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR;
+    shaderClockFeature.pNext = &storage16BitFeature;
+
+    VkPhysicalDeviceBufferDeviceAddressFeatures physicalDeviceAddrFeature = {};
+    physicalDeviceAddrFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+    physicalDeviceAddrFeature.pNext = &shaderClockFeature;
+
+    // position fetch
+    VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR positionFetchFeature = {};
+    positionFetchFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR;
+    positionFetchFeature.pNext = &physicalDeviceAddrFeature;
+
+    // lss
+    VkPhysicalDeviceRayTracingLinearSweptSpheresFeaturesNV lssFeature = {};
+    lssFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_LINEAR_SWEPT_SPHERES_FEATURES_NV;
+    lssFeature.pNext = &positionFetchFeature;
+
+    VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5Feature = {};
+    maintenance5Feature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR;
+    maintenance5Feature.pNext = &lssFeature;
+
+    // ptlas
+    VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptorBufferFeature = {};
+    descriptorBufferFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT;
+    descriptorBufferFeature.pNext = &maintenance5Feature;
+
+    VkPhysicalDevicePartitionedAccelerationStructureFeaturesNV ptlasFeature = {};
+    ptlasFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PARTITIONED_ACCELERATION_STRUCTURE_FEATURES_NV;
+    ptlasFeature.pNext = &descriptorBufferFeature;
+
+    //
+    VkPhysicalDeviceFeatures2 features2 = {};
+    features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features2.pNext = &ptlasFeature;
+    dt.vkGetPhysicalDeviceFeatures2(physicalDevice, &features2);
+    //
+
+    {
+        optFeatureStates[uint8_t(OptVkFeatures::PositionFetch)].isSupported = positionFetchFeature.rayTracingPositionFetch;
+        optFeatureStates[uint8_t(OptVkFeatures::Lss)].isSupported = lssFeature.linearSweptSpheres && lssFeature.spheres;
+        optFeatureStates[uint8_t(OptVkFeatures::Ptlas)].isSupported = ptlasFeature.partitionedAccelerationStructure;
+        optFeatureStates[uint8_t(OptVkFeatures::DescriptorBuffer)].isSupported = descriptorBufferFeature.descriptorBuffer;
+        optFeatureStates[uint8_t(OptVkFeatures::Maintenance5)].isSupported = maintenance5Feature.maintenance5;
+    }
+
+    bool requiredFeaturesSupported = true;
+    {
+        minFeatureStates[uint8_t(MinVkFeatures::Rtas)].isSupported = rtasFeature.accelerationStructure;
+        minFeatureStates[uint8_t(MinVkFeatures::RayQuery)].isSupported = rayQueryFeature.rayQuery;
+        minFeatureStates[uint8_t(MinVkFeatures::Storage16Bit)].isSupported = storage16BitFeature.storageBuffer16BitAccess;
+        minFeatureStates[uint8_t(MinVkFeatures::DeviceAddr)].isSupported = physicalDeviceAddrFeature.bufferDeviceAddress;
+        minFeatureStates[uint8_t(MinVkFeatures::ShaderClock)].isSupported = shaderClockFeature.shaderSubgroupClock;
+        minFeatureStates[uint8_t(MinVkFeatures::CoreFeatures)].isSupported = features2.features.shaderInt16 && features2.features.shaderInt64;
+
+        for (uint8_t i = 0; i < uint8_t(MinVkFeatures::Count); ++i)
+            requiredFeaturesSupported = requiredFeaturesSupported && minFeatureStates[i].isSupported;
+    }
+    return requiredFeaturesSupported;
+}
+
+bool CheckVkFeatureAppState(VkDeviceCreateInfo& deviceCreateInfo, FeatureState* minFeatureStates, FeatureState* optFeatureStates)
+{
+    VkDeviceCreateInfo& info = deviceCreateInfo;
+    const VkBaseOutStructure* next = (VkBaseOutStructure*)info.pNext;
+    while (next)
+    {
+        switch (next->sType)
+        {
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR:
+        {
+            minFeatureStates[uint8_t(MinVkFeatures::Rtas)].isChained = true;
+            VkPhysicalDeviceAccelerationStructureFeaturesKHR* f = (VkPhysicalDeviceAccelerationStructureFeaturesKHR*)next;
+            minFeatureStates[uint8_t(MinVkFeatures::Rtas)].isEnabled = f->accelerationStructure;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR:
+        {
+            minFeatureStates[uint8_t(MinVkFeatures::RayQuery)].isChained = true;
+            VkPhysicalDeviceRayQueryFeaturesKHR* f = (VkPhysicalDeviceRayQueryFeaturesKHR*)next;
+            minFeatureStates[uint8_t(MinVkFeatures::RayQuery)].isEnabled = f->rayQuery;
+            break;
+        }
+
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES:
+        {
+            minFeatureStates[uint8_t(MinVkFeatures::Storage16Bit)].isChained = true;
+            VkPhysicalDevice16BitStorageFeatures* f = (VkPhysicalDevice16BitStorageFeatures*)next;
+            minFeatureStates[uint8_t(MinVkFeatures::Storage16Bit)].isEnabled = f->storageBuffer16BitAccess;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES:
+        {
+            minFeatureStates[uint8_t(MinVkFeatures::Storage16Bit)].isChained = true;
+            VkPhysicalDeviceVulkan11Features* f = (VkPhysicalDeviceVulkan11Features*)next;
+            minFeatureStates[uint8_t(MinVkFeatures::Storage16Bit)].isEnabled = f->storageBuffer16BitAccess;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR:
+        {
+            minFeatureStates[uint8_t(MinVkFeatures::ShaderClock)].isChained = true;
+            VkPhysicalDeviceShaderClockFeaturesKHR* f = (VkPhysicalDeviceShaderClockFeaturesKHR*)next;
+            minFeatureStates[uint8_t(MinVkFeatures::ShaderClock)].isEnabled = f->shaderSubgroupClock;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES:
+        {
+            minFeatureStates[uint8_t(MinVkFeatures::DeviceAddr)].isChained = true;
+            VkPhysicalDeviceBufferDeviceAddressFeatures* f = (VkPhysicalDeviceBufferDeviceAddressFeatures*)next;
+            minFeatureStates[uint8_t(MinVkFeatures::DeviceAddr)].isEnabled = f->bufferDeviceAddress;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES:
+        {
+            minFeatureStates[uint8_t(MinVkFeatures::DeviceAddr)].isChained = true;
+            VkPhysicalDeviceVulkan12Features* f = (VkPhysicalDeviceVulkan12Features*)next;
+            minFeatureStates[uint8_t(MinVkFeatures::DeviceAddr)].isEnabled = f->bufferDeviceAddress;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2:
+        {
+            minFeatureStates[uint8_t(MinVkFeatures::CoreFeatures)].isChained = true;
+            VkPhysicalDeviceFeatures2* f = (VkPhysicalDeviceFeatures2*)next;
+            const bool core = (f->features.shaderInt64 && f->features.shaderInt16);
+            minFeatureStates[uint8_t(MinVkFeatures::CoreFeatures)].isEnabled = core;
+            break;
+        }
+        default: break;
+        }
+
+        switch (next->sType)
+        {
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR:
+        {
+            optFeatureStates[uint8_t(OptVkFeatures::PositionFetch)].isChained = true;
+            VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR* f = (VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR*)next;
+            optFeatureStates[uint8_t(OptVkFeatures::PositionFetch)].isEnabled = f->rayTracingPositionFetch;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_LINEAR_SWEPT_SPHERES_FEATURES_NV:
+        {
+            optFeatureStates[uint8_t(OptVkFeatures::Lss)].isChained = true;
+            VkPhysicalDeviceRayTracingLinearSweptSpheresFeaturesNV* f = (VkPhysicalDeviceRayTracingLinearSweptSpheresFeaturesNV*)next;
+            optFeatureStates[uint8_t(OptVkFeatures::Lss)].isEnabled = (f->linearSweptSpheres && f->spheres);
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT:
+        {
+            optFeatureStates[uint8_t(OptVkFeatures::DescriptorBuffer)].isChained = true;
+            VkPhysicalDeviceDescriptorBufferFeaturesEXT* f = (VkPhysicalDeviceDescriptorBufferFeaturesEXT*)next;
+            optFeatureStates[uint8_t(OptVkFeatures::DescriptorBuffer)].isEnabled = f->descriptorBuffer;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PARTITIONED_ACCELERATION_STRUCTURE_FEATURES_NV:
+        {
+            optFeatureStates[uint8_t(OptVkFeatures::Ptlas)].isChained = true;
+            VkPhysicalDevicePartitionedAccelerationStructureFeaturesNV* f = (VkPhysicalDevicePartitionedAccelerationStructureFeaturesNV*)next;
+            optFeatureStates[uint8_t(OptVkFeatures::Ptlas)].isEnabled = f->partitionedAccelerationStructure;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR:
+        {
+            optFeatureStates[uint8_t(OptVkFeatures::Maintenance5)].isChained = true;
+            VkPhysicalDeviceMaintenance5FeaturesKHR* f = (VkPhysicalDeviceMaintenance5FeaturesKHR*)next;
+            optFeatureStates[uint8_t(OptVkFeatures::Maintenance5)].isEnabled = f->maintenance5;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES:
+        {
+            optFeatureStates[uint8_t(OptVkFeatures::Maintenance5)].isChained = true;
+            VkPhysicalDeviceVulkan14Features* f = (VkPhysicalDeviceVulkan14Features*)next;
+            optFeatureStates[uint8_t(OptVkFeatures::Maintenance5)].isEnabled = f->maintenance5;
+            break;
+        }
+        default:
+            break;
+        }
+        next = next->pNext;
+    }
+
+    if (info.pEnabledFeatures)
+    {
+        minFeatureStates[uint8_t(MinVkFeatures::CoreFeatures)].isChained = true;
+        const bool core = (deviceCreateInfo.pEnabledFeatures->shaderInt64 && deviceCreateInfo.pEnabledFeatures->shaderInt16);
+        minFeatureStates[uint8_t(MinVkFeatures::CoreFeatures)].isEnabled = core;
+    }
+
+    bool requiredFeaturesEnabled = true;
+    for (uint8_t i = 0; i < uint8_t(MinVkFeatures::Count); ++i)
+        requiredFeaturesEnabled = requiredFeaturesEnabled && minFeatureStates[i].isEnabled;
+    return requiredFeaturesEnabled;
+}
+
+struct ExtensionHelper
+{
+    ExtensionHelper(OptVkFeatures inFeature, const char* extName)
+        : feature(inFeature), str(extName) {};
+    OptVkFeatures feature = OptVkFeatures::Count;
+    const char* str = nullptr;
+    bool deviceSupported = false;
+    bool appEnabled = false;
+};
+
+bool CheckExtensionState(VkPhysicalDevice physicalDevice, VulkanDispatchTable& dt, std::vector<const char*>& appExtensions, ExtensionHelper* extensionList, size_t count)
+{
+    bool check = true;
+    { // device support
+        uint32_t deviceExtCount = 0;
+        dt.vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &deviceExtCount, nullptr);
+        std::vector<VkExtensionProperties> deviceExtensions(deviceExtCount);
+        dt.vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &deviceExtCount, deviceExtensions.data());
+
+        for (uint32_t extId = 0; extId < deviceExtCount; ++extId)
+        {
+            for (size_t inId = 0; inId < count; ++inId)
+            {
+                if (strcmp(extensionList[inId].str, deviceExtensions[extId].extensionName) == 0)
+                    extensionList[inId].deviceSupported = true;
+            }
+        }
+
+        for (size_t i = 0; i < count; ++i)
+        { // check that min required extensions are supported by the device
+            if(extensionList[i].feature == OptVkFeatures::MINREQ)
+                check = check && extensionList[i].deviceSupported;
+        }
+    }
+
+    { // check if enabled by the app
+        const size_t appCount = appExtensions.size();
+        for (uint32_t extId = 0; extId < appCount; ++extId)
+        {
+            for (size_t inId = 0; inId < count; ++inId)
+            {
+                if (strcmp(extensionList[inId].str, appExtensions[extId]) == 0)
+                    extensionList[inId].appEnabled = true;
+            }
+        }
+    }
+
+    return check;
+}
+
+bool VerifyExtnesionAndFeatureReadiness(OptVkFeatures feature, FeatureState* optFeatureStates, ExtensionHelper* extensions, size_t extensionCount)
+{
+    bool check = extensionCount > 0;
+    for(size_t i = 0; i < extensionCount; ++i)
+    {
+        if(extensions[i].feature != feature)
+            continue;
+
+        ExtensionHelper& ext = extensions[i];
+        const FeatureState& relatedFeature = optFeatureStates[uint8_t(ext.feature)];
+        check = check && ext.appEnabled && relatedFeature.isEnabled;
+    }
+    return check;
+}
+
 VkResult VKAPI_CALL BvhvSampler_vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkDevice* pDevice)
 {
     InstanceData* instanceData = FindInMap(g_InstanceDataMap, GetKey(physicalDevice));
@@ -159,111 +463,45 @@ VkResult VKAPI_CALL BvhvSampler_vkCreateDevice(VkPhysicalDevice physicalDevice, 
     }
 
     VkDeviceCreateInfo info = *pCreateInfo;
-    std::vector<const char*> extNameArray(info.ppEnabledExtensionNames, info.ppEnabledExtensionNames + info.enabledExtensionCount);
+    std::vector<const char*> appExtensions(info.ppEnabledExtensionNames, info.ppEnabledExtensionNames + info.enabledExtensionCount);
 
-    VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptorBufferFeature = {};
-    descriptorBufferFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT;
-    descriptorBufferFeature.descriptorBuffer = true;
+    FeatureState minFeatureStates[uint8_t(MinVkFeatures::Count)] = {};
+    FeatureState optFeatureStates[uint8_t(OptVkFeatures::Count)] = {};
 
-    VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR positionFetchFeature = {};
-    positionFetchFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR;
-    positionFetchFeature.rayTracingPositionFetch = true;
+    bool validation = g_Connection.IsOpened();
+    if (validation)
+        validation = CheckVkFeaturePhysicalSupport(physicalDevice, instanceData->dispatchTable, minFeatureStates, optFeatureStates);
+    if(validation)
+        validation = CheckVkFeatureAppState(info, minFeatureStates, optFeatureStates);
 
-    bool enableRaytracing = false;
-    bool enableLss = false;
-    bool enablePTLAS = false;
-    bool enablePositionFetch = false;
-    bool enableDescriptorBuffers = false;
-
-    { // detect which features are requested by the caller
-        bool appRequestedSpirv_1_4 = false;
-        bool appRequestedMaintenance5 = false;
-        bool appRequestedLss = false;
-        for (uint32_t i = 0; i < info.enabledExtensionCount; ++i)
-        {
-            if (strcmp(extNameArray[i], VK_KHR_SPIRV_1_4_EXTENSION_NAME) == 0)
-                appRequestedSpirv_1_4 = true;
-
-            const bool ray_tracing = std::string(extNameArray[i]).find("ray_tracing") != std::string::npos;
-            const bool ray_query = std::string(extNameArray[i]).find("ray_query") != std::string::npos;
-            if (ray_tracing || ray_query)
-                enableRaytracing = true;
-
-            if (strcmp(extNameArray[i], VK_KHR_MAINTENANCE_5_EXTENSION_NAME) == 0)
-                appRequestedMaintenance5 = true;
-
-            if (strcmp(extNameArray[i], VK_NV_RAY_TRACING_LINEAR_SWEPT_SPHERES_EXTENSION_NAME) == 0)
-                appRequestedLss = true;
-
-            if(strcmp(extNameArray[i], VK_NV_PARTITIONED_ACCELERATION_STRUCTURE_EXTENSION_NAME) == 0)
-                enablePTLAS = true;
-
-            if(strcmp(extNameArray[i], VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME) == 0)
-                enablePositionFetch = true;
-
-            if(strcmp(extNameArray[i], VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME) == 0)
-                enableDescriptorBuffers = true;
-        }
-        enableLss = appRequestedSpirv_1_4 && appRequestedMaintenance5 && appRequestedLss;
-    }
-
-    if(enableRaytracing)
+    ExtensionHelper extensionList[ ] =
     {
-        uint32_t deviceExtCount = 0;
-        instanceData->dispatchTable.vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &deviceExtCount, nullptr);
-        std::vector<VkExtensionProperties> deviceExtensions(deviceExtCount);
-        instanceData->dispatchTable.vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &deviceExtCount, deviceExtensions.data());
+        // min
+        ExtensionHelper(OptVkFeatures::MINREQ, VK_KHR_SWAPCHAIN_EXTENSION_NAME),
+        ExtensionHelper(OptVkFeatures::MINREQ, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME),
+        ExtensionHelper(OptVkFeatures::MINREQ, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME),
+        ExtensionHelper(OptVkFeatures::MINREQ, VK_KHR_RAY_QUERY_EXTENSION_NAME),
+        ExtensionHelper(OptVkFeatures::MINREQ, VK_KHR_SHADER_CLOCK_EXTENSION_NAME),
+        // lss
+        ExtensionHelper(OptVkFeatures::Lss, VK_KHR_SPIRV_1_4_EXTENSION_NAME),
+        ExtensionHelper(OptVkFeatures::Lss, VK_NV_RAY_TRACING_LINEAR_SWEPT_SPHERES_EXTENSION_NAME),
+        ExtensionHelper(OptVkFeatures::Maintenance5, VK_KHR_MAINTENANCE_5_EXTENSION_NAME),
+        // ptlas
+        ExtensionHelper(OptVkFeatures::Ptlas, VK_NV_PARTITIONED_ACCELERATION_STRUCTURE_EXTENSION_NAME),
+        ExtensionHelper(OptVkFeatures::DescriptorBuffer, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME),
+        // position fetch
+        ExtensionHelper(OptVkFeatures::PositionFetch, VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME)
+    };
 
-        if (enablePTLAS && !enableDescriptorBuffers)
-        { // PTLAS can only be bound via device address. VK_EXT_descriptor_buffer is required for it. Force target device to enable it if supports.
-          // TODO: consider switching to descriptor_heap in the future
-            for (uint32_t decideExtId = 0; decideExtId < deviceExtCount; ++decideExtId)
-            {
-                if (strcmp(deviceExtensions[decideExtId].extensionName, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME) == 0)
-                {
-                    enableDescriptorBuffers = true;
-                    extNameArray.push_back(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
-                    break;
-                }
-            }
-
-            if (enableDescriptorBuffers)
-            {
-                descriptorBufferFeature.pNext = (void*)info.pNext;
-                info.pNext = &descriptorBufferFeature;
-            }
-        }
-
-        const bool forcePositionFetch = g_Connection.IsOpened() ? g_Connection.GetViewerDesc().forcePositionFetchExt : false;
-        if (enableRaytracing && !enablePositionFetch && forcePositionFetch)
-        {
-            for (uint32_t decideExtId = 0; decideExtId < deviceExtCount; ++decideExtId)
-            {
-                if (strcmp(deviceExtensions[decideExtId].extensionName, VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME) == 0)
-                {
-                    enablePositionFetch = true;
-                    extNameArray.push_back(VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME);
-                    break;
-                }
-            }
-
-            if(enablePositionFetch)
-            {
-                positionFetchFeature.pNext = (void*)info.pNext;
-                info.pNext = &positionFetchFeature;
-            }
-        }
-    }
-
-    info.ppEnabledExtensionNames = extNameArray.data();
-    info.enabledExtensionCount = uint32_t(extNameArray.size());
+    if(validation)
+        validation = CheckExtensionState(physicalDevice, instanceData->dispatchTable, appExtensions, extensionList, std::size(extensionList));
 
     std::vector<VkDeviceQueueCreateInfo> newQueueCreateInfo(info.queueCreateInfoCount);
     std::vector<float> graphicsQueuePriorities;
     uint32_t graphicsQueueFamilyId = uint32_t(~0);
     uint32_t computeQueueFamilyId = uint32_t(~0);
     uint32_t customGraphicsQueueId = uint32_t(~0);
-    if (enableRaytracing)
+    if (validation)
     { // request an additional graphics queue to be created
         uint32_t numFamilyProperties = 0;
         instanceData->dispatchTable.vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &numFamilyProperties, nullptr);
@@ -281,22 +519,26 @@ VkResult VKAPI_CALL BvhvSampler_vkCreateDevice(VkPhysicalDevice physicalDevice, 
                 break;
         }
 
-        uint32_t graphicsQueueCreateInfoId = 0;
-        for (; graphicsQueueCreateInfoId < info.queueCreateInfoCount; ++graphicsQueueCreateInfoId)
+        uint32_t graphicsQueueCreateInfoId = uint32_t(~0);
+        for (uint32_t i = 0; i < info.queueCreateInfoCount; ++i)
         {
-            if (info.pQueueCreateInfos[graphicsQueueCreateInfoId].queueFamilyIndex == graphicsQueueFamilyId)
-                break;
+            if (info.pQueueCreateInfos[i].queueFamilyIndex != graphicsQueueFamilyId)
+                continue;
+            graphicsQueueCreateInfoId = i;
+            break;
         }
 
-        const uint32_t maxGraphicsQueueCount = familyProperties[graphicsQueueFamilyId].queueCount;
-        const uint32_t totalRequestedGraphicsQueueCount = info.pQueueCreateInfos[graphicsQueueCreateInfoId].queueCount + 1;
-        if (graphicsQueueFamilyId != uint32_t(~0) && maxGraphicsQueueCount >= totalRequestedGraphicsQueueCount)
+        validation = graphicsQueueFamilyId != uint32_t(~0);
+        validation = validation && graphicsQueueCreateInfoId != uint32_t(~0);
+        validation = validation && familyProperties[graphicsQueueFamilyId].queueCount >= info.pQueueCreateInfos[graphicsQueueCreateInfoId].queueCount + 1;
+
+        if (validation)
         {
             memcpy(newQueueCreateInfo.data(), info.pQueueCreateInfos, info.queueCreateInfoCount * sizeof(VkDeviceQueueCreateInfo));
             customGraphicsQueueId = newQueueCreateInfo[graphicsQueueCreateInfoId].queueCount;
 
             graphicsQueuePriorities.resize(customGraphicsQueueId + 1, 0.5f);
-            memcpy(graphicsQueuePriorities.data(), newQueueCreateInfo[graphicsQueueFamilyId].pQueuePriorities, customGraphicsQueueId * sizeof(float));
+            memcpy(graphicsQueuePriorities.data(), newQueueCreateInfo[graphicsQueueCreateInfoId].pQueuePriorities, customGraphicsQueueId * sizeof(float));
 
             newQueueCreateInfo[graphicsQueueCreateInfoId].queueCount += 1;
             newQueueCreateInfo[graphicsQueueCreateInfoId].pQueuePriorities = graphicsQueuePriorities.data();
@@ -304,6 +546,41 @@ VkResult VKAPI_CALL BvhvSampler_vkCreateDevice(VkPhysicalDevice physicalDevice, 
             info.pQueueCreateInfos = newQueueCreateInfo.data();
         }
     }
+
+    VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR positionFetchFeature = {};
+    {
+        positionFetchFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR;
+        FeatureState& featureState = optFeatureStates[uint8_t(OptVkFeatures::PositionFetch)];
+        if (validation && featureState.isSupported)
+        {
+            ExtensionHelper* pExt = {};
+            for (auto& e : extensionList)
+            {
+                if (strcmp(e.str, VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME) == 0)
+                    pExt = &e;
+            }
+
+            if (pExt)
+            {
+                ExtensionHelper& ext = *pExt;
+                if (!featureState.isChained)
+                { // feauature is not present, but supported. append
+                    positionFetchFeature.rayTracingPositionFetch = true;
+                    positionFetchFeature.pNext = (void*)info.pNext;
+                    info.pNext = &positionFetchFeature;
+                    featureState.isChained = featureState.isEnabled = true;
+                }
+                if (pExt->deviceSupported && !pExt->appEnabled && featureState.isEnabled)
+                {
+                    appExtensions.push_back(ext.str);
+                    ext.appEnabled = true;
+                }
+            }
+        }
+    }
+
+    info.ppEnabledExtensionNames = appExtensions.data();
+    info.enabledExtensionCount = uint32_t(appExtensions.size());
 
     VkLayerDeviceLink*& layerDeviceLink = layerCreateInfo->u.pLayerInfo;
     const PFN_vkGetInstanceProcAddr getInstanceProcAddr = layerDeviceLink->pfnNextGetInstanceProcAddr;
@@ -330,10 +607,7 @@ VkResult VKAPI_CALL BvhvSampler_vkCreateDevice(VkPhysicalDevice physicalDevice, 
     FillVkDispatchTable(&deviceData->dispatchTable, deviceData->device, deviceData->instance, getDeviceProcAddr, getInstanceProcAddr, GetLoaderCallback(pCreateInfo));
     g_DeviceDataMap.insert(std::pair<Key, DeviceData*>(GetKey(*pDevice), deviceData));
 
-    if(g_Connection.IsOpened() == false)
-        return result;
-
-    if (!enableRaytracing)
+    if (validation == false)
         return result;
 
     bool hasComputeQueue = false;
@@ -369,6 +643,17 @@ VkResult VKAPI_CALL BvhvSampler_vkCreateDevice(VkPhysicalDevice physicalDevice, 
 
     if (!internalGraphicsQueue)
         return result;
+
+    bool enableLss = false;
+    bool enablePositionFetch = false;
+    bool enableDescriptorBuffers = false;
+    {
+        enableLss = VerifyExtnesionAndFeatureReadiness(OptVkFeatures::Lss, optFeatureStates, extensionList, std::size(extensionList));
+        enableLss = enableLss && VerifyExtnesionAndFeatureReadiness(OptVkFeatures::Maintenance5, optFeatureStates, extensionList, std::size(extensionList));
+        enablePositionFetch = VerifyExtnesionAndFeatureReadiness(OptVkFeatures::PositionFetch, optFeatureStates, extensionList, std::size(extensionList));
+        enableDescriptorBuffers = VerifyExtnesionAndFeatureReadiness(OptVkFeatures::DescriptorBuffer, optFeatureStates, extensionList, std::size(extensionList));
+        enableDescriptorBuffers = enableDescriptorBuffers && VerifyExtnesionAndFeatureReadiness(OptVkFeatures::Ptlas, optFeatureStates, extensionList, std::size(extensionList));
+    }
 
     deviceData->bvhViewer = new NvBvhViewerVK();
     if (deviceData->bvhViewer)

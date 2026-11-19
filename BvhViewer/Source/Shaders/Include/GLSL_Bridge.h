@@ -245,8 +245,8 @@ rayQueryInitializeEXT( rayQuery, tlas, rayFlags, instanceMask, rayDesc.Origin, r
 #define RayQueryCommittedObjectToWorld( rayQuery )                       _RayQueryCommittedObjectToWorld( rayQuery )
 
 // LSS and spheres
-#define RayQueryCandidateIsLss( rayQuery )                               rayQueryIsLSSHitNV( rayQuery, false )
-#define RayQueryCandidateIsSphere( rayQuery )                            rayQueryIsSphereHitNV( rayQuery, false )
+#define RayQueryCandidateIsLss( rayQuery )                               rayQueryIsLSSHitNV( rayQuery, true )
+#define RayQueryCandidateIsSphere( rayQuery )                            rayQueryIsSphereHitNV( rayQuery, true )
 #define RayQueryCandidateLssPositionsAndRadii( rayQuery )                _RayQueryCandidateLssPositionsAndRadii( rayQuery )
 
 #define RayQueryCommittedIsLss( rayQuery )                                rayQueryIsLSSHitNV( rayQuery, true )

@@ -26,7 +26,6 @@ public:
         uint32_t width;
         uint32_t height;
         bool inlineRendering;
-        bool forcePositionFetchExt;
     };
 
     struct HostDesc

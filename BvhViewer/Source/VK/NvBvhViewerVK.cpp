@@ -399,7 +399,7 @@ void InternalContext::DestroySwapChain()
     for (uint32_t i = 0; i < uint32_t(p.swapChainImageViews.size()); ++i)
         SAFE_VK_RELEASE(vkDestroyImageView, vkDevice, p.swapChainImageViews[i], vkAllocator);
 
-    vkDestroySwapchainKHR(vkDevice, p.swapChain, vkAllocator);
+    SAFE_VK_RELEASE(vkDestroySwapchainKHR, vkDevice, p.swapChain, vkAllocator);
 
     p.framebuffers.clear();
     p.swapChainImageViews.clear();
@@ -424,6 +424,7 @@ void InternalContext::DestroyPresenter()
     p.acquireSemaphores.resize(0); p.acquireSemaphores.shrink_to_fit();
     p.fences.resize(0); p.fences.shrink_to_fit();
 
+    if(ImGui::GetCurrentContext() && ImGui::GetIO().BackendRendererUserData)
     { // imgui
         ImGui_ImplVulkan_Shutdown();
         SAFE_VK_RELEASE(vkDestroyRenderPass, vkDevice, p.renderPass, vkAllocator);

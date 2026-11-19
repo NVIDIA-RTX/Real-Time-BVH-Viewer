@@ -111,7 +111,6 @@ int main(int argc, const char** argv)
             cmdLine.add<uint32_t>("width", 'w', "viewer window initial width", false, 1920);
             cmdLine.add<uint32_t>("height", 'h', "viewer window initial height", false, 1080);
             cmdLine.add("inlineRendering", 0, "enable inline rendering: append commands to target's command buffers. Required for PTLAS and Clustered Geometry");
-            cmdLine.add("forcePositionFetchExt", 0, "force enable position_fetch_ext in VK for wireframe visualization mode");
         }
         if (argc < 2)
         {
@@ -135,7 +134,6 @@ int main(int argc, const char** argv)
         {
             g_SamplerContext.disableD3D12 = cmdLine.exist("disableD3D12");
             g_SamplerContext.disableVk = cmdLine.exist("disableVK");
-            g_SamplerContext.viewerDesc.forcePositionFetchExt = cmdLine.exist("forcePositionFetchExt");
             g_SamplerContext.viewerDesc.inlineRendering = cmdLine.exist("inlineRendering");
             g_SamplerContext.viewerDesc.width = cmdLine.get<uint32_t>("width");
             g_SamplerContext.viewerDesc.height = cmdLine.get<uint32_t>("height");
