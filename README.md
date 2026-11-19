@@ -1,5 +1,7 @@
 # Real-Time BVH Viewer
 
+<img src="https://raw.githubusercontent.com/wiki/NVIDIA-RTX/Real-Time-BVH-Viewer/Resources/bvhviewer.gif" alt="Real-Time BVH Viewer"/>
+
 Real-Time BVH Viewer is a graphics API level utility for inspecting ray tracing acceleration structures while a game or renderer is running. It is intended for engine and game developers who need to understand TLAS/BLAS contents, validate acceleration structure updates, debug geometry-related ray tracing issues, or inspect TLAS management behavior continuously.
 
 The project is designed to be self-contained and vendor-agnostic at the integration level. It supports Direct3D 12 and Vulkan, with optional vendor-specific paths where the graphics API or hardware exposes additional functionality.
