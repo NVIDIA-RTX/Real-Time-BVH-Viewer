@@ -109,8 +109,13 @@ name = type##_br( addr );
 #define DECLARE_THREAD_GROUP_SIZE( x, y, z )\
 layout( local_size_x = x, local_size_y = y, local_size_z = z ) in;
 
-#define INIT_DISPATCH_THREAD_ID_SEMANTIC( type, name )\
+#define DISPATCH_THREAD_ID_SEMANTIC( type, name )\
 const type name = gl_GlobalInvocationID;
+
+#define GROUP_INDEX_SEMANTIC( type, name )\
+const type name = gl_LocalInvocationIndex;
+
+#define NEXT_SEMANTIC 
 
 #define BEGIN_MAIN( THREAD_GROUP, SEMANTICS )\
 THREAD_GROUP \

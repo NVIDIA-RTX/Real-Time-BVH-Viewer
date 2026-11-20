@@ -294,7 +294,9 @@ void HitDesc_ProcessCandidate( inout HitDesc h, RAY_QUERY rq )
     #endif // ENABLE_LSS
 
     #if defined( ENABLE_POSITION_FETCH )
-        if(h.geometryType == GEOMETRY_TYPE_TRIANGLE && GetPackedBool( PACKED_BOOL_ENABLE_WIRE ) && GetPackedBool( PACKED_BOOL_ENABLE_FRAME ))
+        bool isTrinagle = h.geometryType == GEOMETRY_TYPE_TRIANGLE;
+        bool isWireframe = GetPackedBool( PACKED_BOOL_ENABLE_WIRE ) && GetPackedBool( PACKED_BOOL_ENABLE_FRAME );
+        if(isTrinagle && isWireframe)
         {
             float3x3 positions = RayQueryCandidateTrianglePositions( rq );
             float3x4 objectToWorld = RayQueryCandidateObjectToWorld( rq );
@@ -592,7 +594,7 @@ float3 GetTemperatureColor( float t )
 float3 GetProfilingColor( uint beginTimestamp, uint endTimestamp )
 {
     uint deltaTimestamp = TimestampDiff( beginTimestamp, endTimestamp );
-    const float heatmapScale = 65000.0 * gConstants.heatmapScaling;
+    const float heatmapScale = 6500.0 * gConstants.heatmapScaling;
     float deltaTimestampScaled = saturate( float( deltaTimestamp ) / heatmapScale );
     return GetTemperatureColor( deltaTimestampScaled );
 }
@@ -615,7 +617,7 @@ RayDesc PreparePrimaryRay( uint2 pixelPos )
 ////////////////////////////////////////////////////////////////////////
 #define X_SIZE BVH_VIZ_SHDR_X
 #define Y_SIZE BVH_VIZ_SHDR_Y
-BEGIN_MAIN( DECLARE_THREAD_GROUP_SIZE( X_SIZE, Y_SIZE, 1 ), INIT_DISPATCH_THREAD_ID_SEMANTIC( uint3, DTid ) )
+BEGIN_MAIN( DECLARE_THREAD_GROUP_SIZE( X_SIZE, Y_SIZE, 1 ), DISPATCH_THREAD_ID_SEMANTIC( uint3, DTid ) NEXT_SEMANTIC GROUP_INDEX_SEMANTIC( uint, groupIndex ) )
 {
     if( DTid.x > uint( gConstants.renderSize.x ) || DTid.y > uint( gConstants.renderSize.y ) )
         return;
@@ -626,12 +628,25 @@ BEGIN_MAIN( DECLARE_THREAD_GROUP_SIZE( X_SIZE, Y_SIZE, 1 ), INIT_DISPATCH_THREAD
     float proceduralInvFactor = 1.0;
 
     const uint visMode = gConstants.visualizationMode;
+    const bool isHeatMapMode = visMode == VIS_MODE_HEAT_MAP;
+
+    bool enableFlagFilter = gConstants.flagMask != 0 && GetFlagFilterVisualizationMode() == FLAG_VIS_MODE_SHOW;
+    bool enableGeometryTypeFilter = IsGeometryTypeSet( GEOMETRY_TYPE_ALL ) == false;
+    bool enableWireframe = GetPackedBool( PACKED_BOOL_ENABLE_WIRE ) && GetPackedBool( PACKED_BOOL_ENABLE_FRAME );
+    uint numSamples = 1;
+    int numIterations = 1;
+
+    if( isHeatMapMode )
+    {
+        enableFlagFilter = false;
+        enableGeometryTypeFilter = false;
+        enableWireframe = false;
+        numSamples = gConstants.numSamples;
+        numIterations = BVH_VIZ_SHDR_X * BVH_VIZ_SHDR_Y;
+    }
+
     const bool onlyInstanceFlagsSpecified = ( gConstants.flagMask & ( INSTANCE_FLAG_MASK << INSTANCE_FLAG_MASK_SHIFT ) ) == gConstants.flagMask;
     const bool geometryFlagsSpecified = bool( gConstants.flagMask & ( GEOMETRY_FLAG_MASK << GEOMETRY_FLAG_MASK_SHIFT ) );
-    const bool enableFlagFilter = gConstants.flagMask != 0 && GetFlagFilterVisualizationMode() == FLAG_VIS_MODE_SHOW;
-    const bool enableGeometryTypeFilter = IsGeometryTypeSet( GEOMETRY_TYPE_ALL ) == false;
-    const bool enableWireframe = GetPackedBool( PACKED_BOOL_ENABLE_WIRE ) && GetPackedBool( PACKED_BOOL_ENABLE_FRAME ); 
-    const uint numSamples = visMode == VIS_MODE_HEAT_MAP ? gConstants.numSamples : 1;
 
     const bool enableBuiltinPrimitives =
      IsGeometryTypeSet( GEOMETRY_TYPE_TRIANGLE ) ||
@@ -643,7 +658,7 @@ BEGIN_MAIN( DECLARE_THREAD_GROUP_SIZE( X_SIZE, Y_SIZE, 1 ), INIT_DISPATCH_THREAD
     uint rayFlags = enableBuiltinPrimitives ? 0 : RAY_FLAG_SKIP_TRIANGLES;
     rayFlags |= IsGeometryTypeSet( GEOMETRY_TYPE_AABB ) ? 0 : RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES;
 
-    const bool forceNonOpaque = enableFlagFilter || enableGeometryTypeFilter || enableWireframe;
+    const bool forceNonOpaque = !isHeatMapMode && ( enableFlagFilter || enableGeometryTypeFilter || enableWireframe );
     rayFlags |= forceNonOpaque ? RAY_FLAG_FORCE_NON_OPAQUE : RAY_FLAG_FORCE_OPAQUE;
     rayFlags |= GetPackedBool( PACKED_BOOL_CULL_OPAQUE ) ? RAY_FLAG_CULL_OPAQUE : 0;
     rayFlags |= GetPackedBool( PACKED_BOOL_CULL_NON_OPAQUE ) ? RAY_FLAG_CULL_NON_OPAQUE : 0;
@@ -652,75 +667,82 @@ BEGIN_MAIN( DECLARE_THREAD_GROUP_SIZE( X_SIZE, Y_SIZE, 1 ), INIT_DISPATCH_THREAD
 
     RayDesc rayDesc = PreparePrimaryRay( DTid.xy );
     RAY_QUERY rayQuery;
-    for(uint i = 0; i < numSamples; ++i)
+
+    for( int iteration = 0; iteration < numIterations; ++iteration )
     {
-        uint beginTimestamp = GetTimestamp();
-        bool hasHitAABB = false;
-        RayQueryTraceRayInline( rayQuery, gTLAS, rayFlags, gConstants.instanceInclusionMask, rayDesc );
-        while ( RayQueryProceed( rayQuery ) )
+        bool acceptIteration = isHeatMapMode ? groupIndex == iteration : true;
+
+        for(uint i = 0; i < numSamples && acceptIteration; ++i)
         {
-            bool isAABB = ( RayQueryCandidateType( rayQuery ) == CANDIDATE_PROCEDURAL_PRIMITIVE );
-            if( ( isAABB || forceNonOpaque ) == false )
-                continue;
-
-            HitDesc hitDesc = _HitDesc();
-            HitDesc_ProcessCandidate( hitDesc, rayQuery );
-
-            bool acceptHit = true;
-            if( enableFlagFilter )
+            uint beginTimestamp = GetTimestamp();
+            bool hasHitAABB = false;
+            RayQueryTraceRayInline( rayQuery, gTLAS, rayFlags, gConstants.instanceInclusionMask, rayDesc );
+            while ( RayQueryProceed( rayQuery ) )
             {
-                 // can't reject hit if not sure: 
-                 // 1. blas flags are missing, can't check properly
-                 // 2. geometry flags are not being tracked for clustered geometry
-                acceptHit = geometryFlagsSpecified && hitDesc.isClustered;
-                acceptHit = acceptHit || ( onlyInstanceFlagsSpecified == false && hitDesc.blasDescFound == false );
-                const bool geometryFlagsRequested = bool( gConstants.flagMask & ( GEOMETRY_FLAG_MASK << GEOMETRY_FLAG_MASK_SHIFT ) );
-                acceptHit = acceptHit || CheckGeometryMask( hitDesc );
-            }
+                bool isAABB = ( RayQueryCandidateType( rayQuery ) == CANDIDATE_PROCEDURAL_PRIMITIVE );
+                if( ( isAABB || forceNonOpaque ) == false )
+                    continue;
 
-            if( acceptHit && enableGeometryTypeFilter )
-            {
-                acceptHit = IsGeometryTypeSet( hitDesc.geometryType );
-            }
-
-            if( acceptHit && enableWireframe && !isAABB )
-            {
-                acceptHit = hitDesc.isEdge;
-            }
-
-            if ( isAABB && acceptHit )
-            { // update aabb color
-                hasHitAABB = true;
-                acceptHit = false; // only triangles can be accepted. procedural hits require hitT, which can not be calculated here. Axis Aligned Bounding Boxes.
-            }
-
-            if( acceptHit )
-                RayQueryCommitNonOpaqueTriangleHit( rayQuery );
-        }
-        perfColor += GetProfilingColor( beginTimestamp, GetTimestamp() );
-
-        uint numAabbHits = 0;
-        if( hasHitAABB )
-        { // since hitT for AABB is unknown, trace ray from camera limited by hitT from the main traversal
-            RAY_QUERY proceduralRayQuery;
-            RayDesc proceduralRayDesc = rayDesc;
-            proceduralRayDesc.TMax = RayQueryCommittedRayT( rayQuery );
-            RayQueryTraceRayInline( proceduralRayQuery, gTLAS, RAY_FLAG_SKIP_TRIANGLES, gConstants.instanceInclusionMask, proceduralRayDesc );
-            while ( RayQueryProceed( proceduralRayQuery ) )
-            {
                 HitDesc hitDesc = _HitDesc();
-                HitDesc_ProcessCandidate( hitDesc, proceduralRayQuery );
-                g_HashSeed = HitDesc_GetSeed( hitDesc, visMode ) + 0x035F9F29;
-                float3 tmpColor = RNG_GetFloat3().xyz * 0.9;
-                GetSelectionColor( DTid.xy, hitDesc, tmpColor );
-                aabbColor += tmpColor;
-                proceduralInvFactor *= 0.75;
-                ++numAabbHits;
+                HitDesc_ProcessCandidate( hitDesc, rayQuery );
+
+                bool acceptHit = true;
+                if( enableFlagFilter )
+                {
+                     // can't reject hit if not sure: 
+                     // 1. blas flags are missing, can't check properly
+                     // 2. geometry flags are not being tracked for clustered geometry
+                    acceptHit = geometryFlagsSpecified && hitDesc.isClustered;
+                    acceptHit = acceptHit || ( onlyInstanceFlagsSpecified == false && hitDesc.blasDescFound == false );
+                    const bool geometryFlagsRequested = bool( gConstants.flagMask & ( GEOMETRY_FLAG_MASK << GEOMETRY_FLAG_MASK_SHIFT ) );
+                    acceptHit = acceptHit || CheckGeometryMask( hitDesc );
+                }
+
+                if( acceptHit && enableGeometryTypeFilter )
+                {
+                    acceptHit = IsGeometryTypeSet( hitDesc.geometryType );
+                }
+
+                if( acceptHit && enableWireframe && !isAABB )
+                {
+                    acceptHit = hitDesc.isEdge;
+                }
+
+                if ( isAABB && acceptHit )
+                { // update aabb color
+                    hasHitAABB = true;
+                    acceptHit = false; // only triangles can be accepted. procedural hits require hitT, which can not be calculated here. Axis Aligned Bounding Boxes.
+                }
+
+                if( acceptHit )
+                    RayQueryCommitNonOpaqueTriangleHit( rayQuery );
             }
+            perfColor += GetProfilingColor( beginTimestamp, GetTimestamp() );
+
+            uint numAabbHits = 0;
+            if( hasHitAABB )
+            { // since hitT for AABB is unknown, trace ray from camera limited by hitT from the main traversal
+                RAY_QUERY proceduralRayQuery;
+                RayDesc proceduralRayDesc = rayDesc;
+                proceduralRayDesc.TMax = RayQueryCommittedRayT( rayQuery );
+                RayQueryTraceRayInline( proceduralRayQuery, gTLAS, RAY_FLAG_SKIP_TRIANGLES, gConstants.instanceInclusionMask, proceduralRayDesc );
+                while ( RayQueryProceed( proceduralRayQuery ) )
+                {
+                    HitDesc hitDesc = _HitDesc();
+                    HitDesc_ProcessCandidate( hitDesc, proceduralRayQuery );
+                    g_HashSeed = HitDesc_GetSeed( hitDesc, visMode ) + 0x035F9F29;
+                    float3 tmpColor = RNG_GetFloat3().xyz * 0.9;
+                    GetSelectionColor( DTid.xy, hitDesc, tmpColor );
+                    aabbColor += tmpColor;
+                    proceduralInvFactor *= 0.75;
+                    ++numAabbHits;
+                }
+            }
+            aabbColor /= max( float( numAabbHits ), 1.0 );
         }
-        aabbColor /= max( float( numAabbHits ), 1.0 );
+        perfColor /= acceptIteration ? max( float( numSamples ), 1.0 ) : 1.0;
+        GROUP_BARRIER();
     }
-    perfColor /= float( numSamples );
 
     if ( RayQueryCommittedStatus( rayQuery ) == COMMITTED_NOTHING )
     {

@@ -37,7 +37,7 @@
 #define MI_RESOLVE_SHDR_X 1
 #define MI_RESOLVE_SHDR_Y 1
 
-#define BVH_VIZ_SHDR_X 4
+#define BVH_VIZ_SHDR_X 8
 #define BVH_VIZ_SHDR_Y 4
 
 struct ConstantBufferLayout

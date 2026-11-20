@@ -228,7 +228,7 @@ struct ExposedSettings
     bool cullBackFace = false;
     bool cullFrontFace = false;
     uint8_t instanceInclusionMask = 0xFF;
-    int32_t numSamples = 1;
+    int32_t numSamples = 2;
     int32_t debugUint = 0;
     CameraUp cameraUp = CameraUp::Y;
 

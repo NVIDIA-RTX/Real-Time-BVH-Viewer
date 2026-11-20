@@ -51,7 +51,7 @@ void WriteOutSignature( MultiIndirectResloveInputsArgs data )
 
 #define X_SIZE MI_RESOLVE_SHDR_X
 #define Y_SIZE MI_RESOLVE_SHDR_Y
-BEGIN_MAIN( DECLARE_THREAD_GROUP_SIZE( X_SIZE, Y_SIZE, 1 ), INIT_DISPATCH_THREAD_ID_SEMANTIC( uint3, DTid ) )
+BEGIN_MAIN( DECLARE_THREAD_GROUP_SIZE( X_SIZE, Y_SIZE, 1 ), DISPATCH_THREAD_ID_SEMANTIC( uint3, DTid ) )
 {
     const uint id = DTid.x;
     if( id > 0 )

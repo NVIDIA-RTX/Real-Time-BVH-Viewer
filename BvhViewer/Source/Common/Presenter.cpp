@@ -290,6 +290,7 @@ void PopulateUi(PresenterNewFrameDesc& desc)
         ImGui::Begin("Nv BVH Viewer", NULL, windowFlags);
         ImGui::Text("%7.4fms (%5.2f fps)", io.DeltaTime * 1000.0f, io.Framerate);
         bool show = false;
+        bool isHeatmap = settings.visualizationMode == int(VIS_MODE_HEAT_MAP);
 
         { // RENDER
             ImGui::NewLine();
@@ -299,15 +300,15 @@ void PopulateUi(PresenterNewFrameDesc& desc)
             {
                 ImGui::Combo("Color by", &settings.visualizationMode, g_VisualizationModeNames, int(VIS_MODE_NUM));
 
-                if (settings.visualizationMode == int(VIS_MODE_HEAT_MAP))
+                if (isHeatmap)
                 {
                     ImGui::DragFloat("Heatmap Scaling", &settings.heatmapScaling, 0.1f, 0.1f, 100.0f, "%.2f", ImGuiSliderFlags_::ImGuiSliderFlags_Logarithmic);
                     ImGui::PushStyleColor(0, c_Grey);
-                    ImGui::Text("timestampDelta = saturate(timestampDelta / %.1f)", 65000.0f * settings.heatmapScaling);
+                    ImGui::Text("timestampDelta = saturate(timestampDelta / %.1f)", 6500.0f * settings.heatmapScaling);
                     ImGui::PopStyleColor();
-                    ImGui::SliderInt("Num Samples", &settings.numSamples, 1, 64);
+                    ImGui::SliderInt("Num Samples", &settings.numSamples, 1, 16);
                 }
-                if (settings.visualizationMode == int(VIS_MODE_UPDATE_STATE))
+                else if (settings.visualizationMode == int(VIS_MODE_UPDATE_STATE))
                 {
                     AddColorHint(c_Red, "Rebuild", " - full rebuild");
                     AddColorHint(c_Orange, "Refit", " - update / refit");
@@ -376,7 +377,7 @@ void PopulateUi(PresenterNewFrameDesc& desc)
                     settings.windowOnTop = windowOnTop;
                 }
 
-                if (allowWireAndFrame)
+                if (allowWireAndFrame && !isHeatmap)
                 {
                     ImGui::Checkbox("Bary", &settings.enableBarycentricShading);
 
@@ -536,94 +537,95 @@ void PopulateUi(PresenterNewFrameDesc& desc)
             ImGui::PushID("geometry");
             if (show)
             {
-                ImGui::Text("Ray Culling:");
-                {
-                    ImGui::Checkbox("Opaque", &settings.cullOpaque);
-                    ImGui::SameLine();
-                    ImGui::Checkbox("NonOpaque", &settings.cullNonOpaque);
-                    ImGui::SameLine();
-                    if(ImGui::RadioButton("BackFace", settings.cullBackFace))
+                if (!isHeatmap)
+                { // culling, flag selection
+                    ImGui::Text("Ray Culling:");
                     {
-                        settings.cullBackFace = !settings.cullBackFace;
-                        settings.cullFrontFace = settings.cullBackFace ? false : settings.cullFrontFace;
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::RadioButton("FrontFace", settings.cullFrontFace))
-                    {
-                        settings.cullFrontFace = !settings.cullFrontFace;
-                        settings.cullBackFace = settings.cullFrontFace ? false : settings.cullBackFace;
-                    }
-                }
-                ImGui::Separator();
-
-                ImGui::Text("RT Primitive Types:");
-                {
-                    if (ImGui::BeginTable("primitives", 3, ImGuiTableFlags_Resizable | ImGuiTableFlags_NoSavedSettings | ImGuiTableFlags_Borders))
-                    {
-                        for (uint32_t i = 0; i < uint32_t(RtGeometryPrimitiveTypes::Count); ++i)
+                        ImGui::Checkbox("Opaque", &settings.cullOpaque);
+                        ImGui::SameLine();
+                        ImGui::Checkbox("NonOpaque", &settings.cullNonOpaque);
+                        ImGui::SameLine();
+                        if (ImGui::RadioButton("BackFace", settings.cullBackFace))
                         {
-                            ImGui::TableNextColumn();
-                            ImGui::Selectable(g_GeometryPrimitiveNames[i], &settings.primitiveTypeToggles[i]);
+                            settings.cullBackFace = !settings.cullBackFace;
+                            settings.cullFrontFace = settings.cullBackFace ? false : settings.cullFrontFace;
                         }
-                        ImGui::EndTable();
+                        ImGui::SameLine();
+                        if (ImGui::RadioButton("FrontFace", settings.cullFrontFace))
+                        {
+                            settings.cullFrontFace = !settings.cullFrontFace;
+                            settings.cullBackFace = settings.cullFrontFace ? false : settings.cullBackFace;
+                        }
+                    }
+                    ImGui::Separator();
+
+                    ImGui::Text("RT Primitive Types:");
+                    {
+                        if (ImGui::BeginTable("primitives", 3, ImGuiTableFlags_Resizable | ImGuiTableFlags_NoSavedSettings | ImGuiTableFlags_Borders))
+                        {
+                            for (uint32_t i = 0; i < uint32_t(RtGeometryPrimitiveTypes::Count); ++i)
+                            {
+                                ImGui::TableNextColumn();
+                                ImGui::Selectable(g_GeometryPrimitiveNames[i], &settings.primitiveTypeToggles[i]);
+                            }
+                            ImGui::EndTable();
+                        }
+                    }
+                    ImGui::Separator();
+
+                    {
+                        float width = ImGui::CalcTextSize(g_FlagVisualizationModes[settings.flagVisualizationMode]).x + ImGui::GetStyle().FramePadding.x * 8.0f;
+                        ImGui::PushItemWidth(width);
+                        ImGui::PushID(0xCEBA + 0);
+                        ImGui::Combo("", &settings.flagVisualizationMode, g_FlagVisualizationModes, std::size(g_FlagVisualizationModes));
+                        ImGui::PopID();
+                        ImGui::PopItemWidth();
+                        ImGui::SameLine();
+
+                        width = ImGui::CalcTextSize(g_FlagInclusionModes[settings.flagInclusionMode]).x + ImGui::GetStyle().FramePadding.x * 8.0f;
+                        ImGui::PushItemWidth(width);
+                        ImGui::PushID(0xCEBA + 1);
+                        ImGui::Combo("", &settings.flagInclusionMode, g_FlagInclusionModes, std::size(g_FlagInclusionModes));
+                        ImGui::PopID();
+                        ImGui::SameLine();
+                        ImGui::PopItemWidth();
+
+                        width = ImGui::CalcTextSize(g_FlagLogicalOperatorModes[settings.flagLogicalOperator]).x + ImGui::GetStyle().FramePadding.x * 8.0f;
+                        ImGui::PushItemWidth(width);
+                        ImGui::PushID(0xCEBA + 2);
+                        ImGui::Combo("", &settings.flagLogicalOperator, g_FlagLogicalOperatorModes, std::size(g_FlagLogicalOperatorModes));
+                        ImGui::PopID();
+                        ImGui::PopItemWidth();
+
+                        bool anyFlagSet = false;
+                        auto ConstructRtFlagTable = [&anyFlagSet](const char* id, const RtFlagDesc* flagList, bool* flagState, uint32_t flagNum)
+                            {
+                                constexpr int numColumns = 2;
+                                ImGui::Text("%s", id);
+                                if (ImGui::BeginTable(id, numColumns, ImGuiTableFlags_Resizable | ImGuiTableFlags_NoSavedSettings | ImGuiTableFlags_Borders))
+                                {
+                                    for (uint32_t i = 0; i < flagNum; ++i)
+                                    {
+                                        ImGui::TableNextColumn();
+                                        ImGui::Selectable(flagList[i].str, &flagState[i]);
+                                        anyFlagSet |= flagState[i];
+                                    }
+                                    ImGui::EndTable();
+                                }
+                            };
+
+                        ConstructRtFlagTable("Instance Flags:", g_RtInstanceFlagDescs, settings.instanceFlagStates, INSTANCE_FLAG_NUM);
+                        ConstructRtFlagTable("Build Flags:", g_RtBuildFlagDesc, settings.buildFlagStates, AS_BUILD_FLAG_NUM);
+                        ConstructRtFlagTable("Geometry Flags:", g_RtGeometryFlagDescs, settings.geometryFlagStates, GEOMETRY_FLAG_NUM);
+
+                        if (anyFlagSet)
+                            AddColorHint(c_DarkGrey, "No Data", " - no build data or can't resolve");
                     }
                 }
-                ImGui::Separator();
-
-                {
-                    float width = ImGui::CalcTextSize(g_FlagVisualizationModes[settings.flagVisualizationMode]).x + ImGui::GetStyle().FramePadding.x * 8.0f;
-                    ImGui::PushItemWidth(width);
-                    ImGui::PushID(0xCEBA + 0);
-                    ImGui::Combo("", &settings.flagVisualizationMode, g_FlagVisualizationModes, std::size(g_FlagVisualizationModes));
-                    ImGui::PopID();
-                    ImGui::PopItemWidth();
-                    ImGui::SameLine();
-
-                    width = ImGui::CalcTextSize(g_FlagInclusionModes[settings.flagInclusionMode]).x + ImGui::GetStyle().FramePadding.x * 8.0f;
-                    ImGui::PushItemWidth(width);
-                    ImGui::PushID(0xCEBA + 1);
-                    ImGui::Combo("", &settings.flagInclusionMode, g_FlagInclusionModes, std::size(g_FlagInclusionModes));
-                    ImGui::PopID();
-                    ImGui::SameLine();
-                    ImGui::PopItemWidth();
-
-                    width = ImGui::CalcTextSize(g_FlagLogicalOperatorModes[settings.flagLogicalOperator]).x + ImGui::GetStyle().FramePadding.x * 8.0f;
-                    ImGui::PushItemWidth(width);
-                    ImGui::PushID(0xCEBA + 2);
-                    ImGui::Combo("", &settings.flagLogicalOperator, g_FlagLogicalOperatorModes, std::size(g_FlagLogicalOperatorModes));
-                    ImGui::PopID();
-                    ImGui::PopItemWidth();
-
-                    bool anyFlagSet = false;
-                    auto ConstructRtFlagTable = [&anyFlagSet](const char* id, const RtFlagDesc* flagList, bool* flagState, uint32_t flagNum)
-                        {
-                            constexpr int numColumns = 2;
-                            ImGui::Text("%s", id);
-                            if (ImGui::BeginTable(id, numColumns, ImGuiTableFlags_Resizable | ImGuiTableFlags_NoSavedSettings | ImGuiTableFlags_Borders))
-                            {
-                                for (uint32_t i = 0; i < flagNum; ++i)
-                                {
-                                    ImGui::TableNextColumn();
-                                    ImGui::Selectable(flagList[i].str, &flagState[i]);
-                                    anyFlagSet |= flagState[i];
-                                }
-                                ImGui::EndTable();
-                            }
-                        };
-
-                    ConstructRtFlagTable("Instance Flags:", g_RtInstanceFlagDescs, settings.instanceFlagStates, INSTANCE_FLAG_NUM);
-                    ConstructRtFlagTable("Build Flags:", g_RtBuildFlagDesc, settings.buildFlagStates, AS_BUILD_FLAG_NUM);
-                    ConstructRtFlagTable("Geometry Flags:", g_RtGeometryFlagDescs, settings.geometryFlagStates, GEOMETRY_FLAG_NUM);
-
-                    if (anyFlagSet)
-                        AddColorHint(c_DarkGrey, "No Data", " - no build data or can't resolve");
-                }
-
 #if _DEBUG
                 ImGui::InputInt("Debug", &settings.debugUint, 1, 1);
                 settings.debugUint = settings.debugUint < 0 ? 0 : settings.debugUint;
 #endif
-
                 if (feedbackBuffer)
                 {
                     static ViewerBlasDesc blasDesc = {};

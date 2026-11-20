@@ -52,8 +52,13 @@ CONSTANT_BUFFER_BINDING( name##_layout, name, slot )
 #define DECLARE_THREAD_GROUP_SIZE( x, y, z )\
 [ numthreads( x, y, z ) ]
 
-#define INIT_DISPATCH_THREAD_ID_SEMANTIC( type, name )\
+#define DISPATCH_THREAD_ID_SEMANTIC( type, name )\
 type name : SV_DispatchThreadId
+
+#define GROUP_INDEX_SEMANTIC( type, name )\
+type name : SV_GroupIndex
+
+#define NEXT_SEMANTIC ,
 
 #define BEGIN_MAIN( THREAD_GROUP, SEMANTICS )\
 THREAD_GROUP \

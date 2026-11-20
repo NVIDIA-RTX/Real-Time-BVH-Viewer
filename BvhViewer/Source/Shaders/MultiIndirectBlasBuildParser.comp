@@ -60,7 +60,7 @@ HASH_MAP_IMPLEMENTATION( Blas, inBlasKey, inBlasData, ClusteredBlasDescGPU, gCon
 ////////////////////////////////////////////////////////////////////////
 #define X_SIZE CLAS_PARSE_SHDR_X
 #define Y_SIZE CLAS_PARSE_SHDR_Y
-BEGIN_MAIN( DECLARE_THREAD_GROUP_SIZE( X_SIZE, Y_SIZE, 1 ), INIT_DISPATCH_THREAD_ID_SEMANTIC( uint3, DTid ) )
+BEGIN_MAIN( DECLARE_THREAD_GROUP_SIZE( X_SIZE, Y_SIZE, 1 ), DISPATCH_THREAD_ID_SEMANTIC( uint3, DTid ) )
 {
     const uint id = DTid.x;
     const uint count = gDispatchConstants.clasCount > gConstants.maxClasPerBlas ? gConstants.maxClasPerBlas : gDispatchConstants.clasCount;
